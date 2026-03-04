@@ -12,6 +12,7 @@ import igraph as ig
 import re
 import logging
 import torch
+from src.vision_encoder import VisionEncoder
 logger = logging.getLogger(__name__)
 
 
@@ -28,6 +29,11 @@ class LinearRAG:
             logger.info(f"Using device: {self.device} for vectorized retrieval")
         
         self.dataset_name = global_config.dataset_name
+        
+        # 初始化 VisionEncoder (如果需要)
+        if self.config.use_image_retrieval:
+            self.vision_encoder = VisionEncoder(self.config.vision_embedding_model, device=str(self.device))
+        
         self.load_embedding_store()
         self.llm_model = self.config.llm_model
         self.spacy_ner = SpacyNER(self.config.spacy_model)
@@ -37,6 +43,9 @@ class LinearRAG:
         self.passage_embedding_store = EmbeddingStore(self.config.embedding_model, db_filename=os.path.join(self.config.working_dir,self.dataset_name, "passage_embedding.parquet"), batch_size=self.config.batch_size, namespace="passage")
         self.entity_embedding_store = EmbeddingStore(self.config.embedding_model, db_filename=os.path.join(self.config.working_dir,self.dataset_name, "entity_embedding.parquet"), batch_size=self.config.batch_size, namespace="entity")
         self.sentence_embedding_store = EmbeddingStore(self.config.embedding_model, db_filename=os.path.join(self.config.working_dir,self.dataset_name, "sentence_embedding.parquet"), batch_size=self.config.batch_size, namespace="sentence")
+        if self.config.use_image_retrieval:
+            # 关键：图像 Store 必须使用 vision_encoder
+            self.image_embedding_store = EmbeddingStore(self.vision_encoder, db_filename=os.path.join(self.config.working_dir,self.dataset_name, "image_embedding.parquet"), batch_size=self.config.batch_size, namespace="image")
 
     def load_existing_data(self,passage_hash_ids):
         self.ner_results_path = os.path.join(self.config.working_dir,self.dataset_name, "ner_results.json")
@@ -57,14 +66,21 @@ class LinearRAG:
         for retrieval_result in retrieval_results:
             question = retrieval_result["question"]
             sorted_passage = retrieval_result["sorted_passage"]
+            retrieved_images = retrieval_result.get("retrieved_images", [])
             prompt_user = """"""
             for passage in sorted_passage:
                 prompt_user += f"{passage}\n"
+            if retrieved_images:
+                prompt_user += "Retrieved Images:\n"
+                for image_item in retrieved_images:
+                    prompt_user += f"- {image_item['path']} (score={image_item['score']:.4f})\n"
             prompt_user += f"Question: {question}\n Thought: "
-            messages = [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": prompt_user}
-            ]
+            image_paths = [item["path"] for item in retrieved_images[: self.config.max_qa_images]]
+            messages = self.llm_model.build_qa_messages(
+                system_prompt=system_prompt,
+                prompt_user_text=prompt_user,
+                image_paths=image_paths,
+            )
             all_messages.append(messages)
         with ThreadPoolExecutor(max_workers=self.config.max_workers) as executor:
             all_qa_results = list(tqdm(
@@ -88,6 +104,12 @@ class LinearRAG:
         self.passage_embeddings = np.array(self.passage_embedding_store.embeddings)
         self.sentence_hash_ids = list(self.sentence_embedding_store.hash_id_to_text.keys())
         self.sentence_embeddings = np.array(self.sentence_embedding_store.embeddings)
+        if self.config.use_image_retrieval and hasattr(self, "image_embedding_store"):
+            self.image_hash_ids = list(self.image_embedding_store.hash_id_to_text.keys())
+            self.image_embeddings = np.array(self.image_embedding_store.embeddings)
+        else:
+            self.image_hash_ids = []
+            self.image_embeddings = np.array([])
         self.node_name_to_vertex_idx = {v["name"]: v.index for v in self.graph.vs if "name" in v.attributes()}
         self.vertex_idx_to_node_name = {v.index: v["name"] for v in self.graph.vs if "name" in v.attributes()}
 
@@ -117,16 +139,64 @@ class LinearRAG:
             else:
                 sorted_passage_indices,sorted_passage_scores = self.dense_passage_retrieval(question_embedding)
                 final_passage_indices = sorted_passage_indices[:self.config.retrieval_top_k]
+                final_passage_hash_ids = [self.passage_embedding_store.hash_ids[idx] for idx in final_passage_indices]
                 final_passage_scores = sorted_passage_scores[:self.config.retrieval_top_k]
                 final_passages = [self.passage_embedding_store.texts[idx] for idx in final_passage_indices]
+
+            retrieved_images = []
+            if self.config.use_image_retrieval:
+                image_indices, image_scores = self.dense_image_retrieval(question)
+                top_img_k = self.config.retrieval_top_k_image
+                for img_idx, img_score in zip(image_indices[:top_img_k], image_scores[:top_img_k]):
+                    retrieved_images.append({
+                        "path": self.image_embedding_store.texts[img_idx],
+                        "score": float(img_score)
+                    })
+                final_passage_hash_ids, final_passages, final_passage_scores = self.fuse_passage_with_images(
+                    final_passage_hash_ids, final_passages, final_passage_scores, retrieved_images
+                )
             result = {
                 "question": question,
                 "sorted_passage": final_passages,
                 "sorted_passage_scores": final_passage_scores,
+                "retrieved_images": retrieved_images,
                 "gold_answer": question_info["answer"]
             }
             retrieval_results.append(result)
         return retrieval_results
+
+    def fuse_passage_with_images(self, passage_hash_ids, passages, passage_scores, retrieved_images):
+        if not passage_hash_ids or not retrieved_images:
+            return passage_hash_ids, passages, passage_scores
+
+        score_map = {hid: float(score) for hid, score in zip(passage_hash_ids, passage_scores)}
+        # Boost passages when top retrieved image likely comes from the same PDF.
+        for item in retrieved_images:
+            image_path = item["path"]
+            image_score = item["score"]
+            pdf_identifier = self.extract_pdf_identifier_from_image_path(image_path)
+            if not pdf_identifier:
+                continue
+            for hid in passage_hash_ids:
+                text = self.passage_embedding_store.hash_id_to_text.get(hid, "")
+                if f"pdf:{pdf_identifier}:" in text:
+                    score_map[hid] += self.config.image_ratio * image_score
+
+        sorted_items = sorted(score_map.items(), key=lambda x: x[1], reverse=True)
+        sorted_hash_ids = [hid for hid, _ in sorted_items]
+        sorted_scores = [score for _, score in sorted_items]
+        sorted_passages = [self.passage_embedding_store.hash_id_to_text[hid] for hid in sorted_hash_ids]
+        return sorted_hash_ids, sorted_passages, sorted_scores
+
+    @staticmethod
+    def extract_pdf_identifier_from_image_path(image_path):
+        # image_output_dir uses "import/pdf_images/<pdf_basename>/...", where basename includes ".pdf"
+        norm_path = os.path.normpath(image_path)
+        parts = norm_path.split(os.sep)
+        if len(parts) < 2:
+            return ""
+        parent = parts[-2]
+        return parent.strip()
     
     def _precompute_sparse_matrices(self):
         """
@@ -505,6 +575,16 @@ class LinearRAG:
         sorted_passage_indices = np.argsort(question_passage_similarities)[::-1]
         sorted_passage_scores = question_passage_similarities[sorted_passage_indices].tolist()
         return sorted_passage_indices, sorted_passage_scores
+
+    def dense_image_retrieval(self, question):
+        if len(self.image_embeddings) == 0:
+            return np.array([], dtype=np.int64), []
+        question_image_embedding = self.vision_encoder.encode_text(question, normalize_embeddings=True)[0]
+        question_image_embedding = question_image_embedding.reshape(1, -1)
+        image_similarities = np.dot(self.image_embeddings, question_image_embedding.T).flatten()
+        sorted_image_indices = np.argsort(image_similarities)[::-1]
+        sorted_image_scores = image_similarities[sorted_image_indices].tolist()
+        return sorted_image_indices, sorted_image_scores
     
     def get_seed_entities(self, question):
         question_entities = list(self.spacy_ner.question_ner(question))
@@ -528,10 +608,20 @@ class LinearRAG:
             seed_entity_scores.append(best_entity_score)
         return seed_entity_indices, seed_entity_texts, seed_entity_hash_ids, seed_entity_scores
 
-    def index(self, passages):
+    def index(self, passages, images_data, pdf_data):
         self.node_to_node_stats = defaultdict(dict)
         self.entity_to_sentence_stats = defaultdict(dict)
+        
+        # 1. 文本索引
         self.passage_embedding_store.insert_text(passages)
+        
+        # 2. 图像索引 (多模态)
+        if self.config.use_image_retrieval and len(images_data) > 0:
+            logger.info(f"正在索引 {len(images_data)} 张图像...")
+            # images_data 格式: [{"path": "..."}, ...]
+            image_paths = [img["path"] for img in images_data]
+            self.image_embedding_store.insert_image(image_paths)
+
         hash_id_to_passage = self.passage_embedding_store.get_hash_id_to_text()
         existing_passage_hash_id_to_entities,existing_sentence_to_entities, new_passage_hash_ids = self.load_existing_data(hash_id_to_passage.keys())
         if len(new_passage_hash_ids) > 0:

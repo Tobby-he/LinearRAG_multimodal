@@ -13,7 +13,9 @@ class Evaluator:
         self.prediction_results = self.load_predictions()
 
     def load_predictions(self):
-        prediction_results = json.load(open(self.predictions_path))
+        # 修复：增加 encoding="utf-8" 解决 UnicodeDecodeError
+        with open(self.predictions_path, "r", encoding="utf-8") as f:
+            prediction_results = json.load(f)
         return prediction_results
     
     def calculate_llm_accuracy(self,pre_answer,gold_ans):
