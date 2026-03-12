@@ -1,6 +1,7 @@
 import json
 import os
-from src.utils import normalize_answer
+from src.text_metrics import contain_score, exact_match_score, token_f1_score
+from src.task_eval import compute_task_metrics, extract_gold_answer_text
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from tqdm import tqdm
 import logging
@@ -40,28 +41,30 @@ class Evaluator:
             return 0.0
 
     def calculate_contain(self,pre_answers,gold_ans):
-        if pre_answers is None or pre_answers == "" or (isinstance(pre_answers, str) and pre_answers.strip() == ""):
-            return 0            
-        if gold_ans is None or gold_ans == "" or (isinstance(gold_ans, str) and gold_ans.strip() == ""):
-            return 0
-        s1 = normalize_answer(pre_answers)
-        s2 = normalize_answer(gold_ans)
-        if s2 in s1:
-            return 1
-        else:
-            return 0
+        return contain_score(pre_answers, gold_ans)
+
+    def calculate_exact_match(self, pre_answer, gold_ans):
+        return exact_match_score(pre_answer, gold_ans)
+
+    def calculate_token_f1(self, pre_answer, gold_ans):
+        return token_f1_score(pre_answer, gold_ans)
             
     def evaluate_sig_sample(self,idx,prediction):
         pre_answer = prediction["pred_answer"]
-        gold_ans = prediction["gold_answer"]
+        gold_ans = extract_gold_answer_text(prediction["gold_answer"], prediction.get("question_type", ""))
+        question_type = prediction.get("question_type", "")
         # llm_acc = 0.0
         llm_acc = self.calculate_llm_accuracy(pre_answer, gold_ans)
         contain_acc = self.calculate_contain(pre_answer, gold_ans)
-        return idx, llm_acc, contain_acc
+        exact_match = self.calculate_exact_match(pre_answer, gold_ans)
+        summary_token_f1 = self.calculate_token_f1(pre_answer, gold_ans) if question_type == "summary" else None
+        return idx, llm_acc, contain_acc, exact_match, summary_token_f1
 
     def evaluate(self,max_workers):
         llm_scores = [0.0] * len(self.prediction_results)
         contain_scores = [0.0] * len(self.prediction_results)
+        exact_match_scores = [0.0] * len(self.prediction_results)
+        summary_token_f1_scores = [None] * len(self.prediction_results)
         
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             futures = {
@@ -74,11 +77,15 @@ class Evaluator:
             total_contain_score = 0.0
             pbar = tqdm(total=len(futures), desc="Evaluating samples", unit="sample")
             for future in as_completed(futures):
-                idx, llm_acc, contain_acc  = future.result()
+                idx, llm_acc, contain_acc, exact_match, summary_token_f1  = future.result()
                 llm_scores[idx] = llm_acc
                 contain_scores[idx] = contain_acc
+                exact_match_scores[idx] = exact_match
+                summary_token_f1_scores[idx] = summary_token_f1
                 self.prediction_results[idx]["llm_accuracy"] = llm_acc
                 self.prediction_results[idx]["contain_accuracy"] = contain_acc
+                self.prediction_results[idx]["exact_match"] = exact_match
+                self.prediction_results[idx]["summary_token_f1"] = summary_token_f1
                 total_llm_score += llm_acc
                 total_contain_score += contain_acc
                 completed += 1
@@ -93,13 +100,42 @@ class Evaluator:
 
         llm_accuracy = sum(llm_scores) / len(llm_scores)
         contain_accuracy = sum(contain_scores) / len(contain_scores)
+        exact_match_accuracy = sum(exact_match_scores) / len(exact_match_scores)
+        non_summary_exact_scores = [
+            exact_match_scores[idx]
+            for idx, pred in enumerate(self.prediction_results)
+            if pred.get("question_type") != "summary"
+        ]
+        summary_token_f1_values = [x for x in summary_token_f1_scores if x is not None]
+        summary_metrics = {
+            "count": len(summary_token_f1_values),
+            "token_f1": (sum(summary_token_f1_values) / len(summary_token_f1_values)) if summary_token_f1_values else 0.0,
+        }
+        task_metrics = compute_task_metrics(self.prediction_results)
 
         logger.info(f"Evaluation Results:")
         logger.info(f"  LLM Accuracy: {llm_accuracy:.4f} ({sum(llm_scores)}/{len(llm_scores)})")
         logger.info(f"  Contain Accuracy: {contain_accuracy:.4f} ({sum(contain_scores)}/{len(contain_scores)})")
+        logger.info(f"  Exact Match: {exact_match_accuracy:.4f} ({sum(exact_match_scores)}/{len(exact_match_scores)})")
+        if non_summary_exact_scores:
+            logger.info(f"  Exact Match (Non-summary): {sum(non_summary_exact_scores) / len(non_summary_exact_scores):.4f}")
+        logger.info(f"  Summary Token F1: {summary_metrics['token_f1']:.4f} ({summary_metrics['count']} samples)")
+        logger.info(f"  Title EM: {task_metrics['title_em']:.4f}")
+        logger.info(f"  First Figure Token EM: {task_metrics['first_figure_token_em']:.4f}")
+        logger.info(f"  Summary Token F1 (Task): {task_metrics['summary_token_f1']:.4f}")
+        logger.info(f"  Quant Token Match: {task_metrics['quant_token_match']:.4f}")
+        logger.info(f"  Quant Token F1: {task_metrics['quant_token_f1']:.4f}")
+        logger.info(f"  Quant Canonical Answer EM: {task_metrics['quant_canonical_answer_em']:.4f}")
         with open(self.predictions_path, "w", encoding="utf-8") as f:
             json.dump(self.prediction_results, f, ensure_ascii=False, indent=4)
         
         with open(os.path.join(os.path.dirname(self.predictions_path), "evaluation_results.json"), "w", encoding="utf-8") as f:
-            json.dump({"llm_accuracy": llm_accuracy, "contain_accuracy": contain_accuracy}, f, ensure_ascii=False, indent=4)
+            json.dump({
+                "llm_accuracy": llm_accuracy,
+                "contain_accuracy": contain_accuracy,
+                "exact_match_accuracy": exact_match_accuracy,
+                "non_summary_exact_match_accuracy": (sum(non_summary_exact_scores) / len(non_summary_exact_scores)) if non_summary_exact_scores else 0.0,
+                "summary_metrics": summary_metrics,
+                "task_metrics": task_metrics,
+            }, f, ensure_ascii=False, indent=4)
         return llm_accuracy, contain_accuracy

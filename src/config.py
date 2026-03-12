@@ -25,3 +25,5 @@ class LinearRAGConfig:
     retrieval_top_k_image: int = 5
     image_ratio: float = 0.5
     max_qa_images: int = 3
+    router_semantic_threshold: float = 0.42
+    router_aggregation_mode: str = "max"

@@ -52,7 +52,9 @@ def parse_arguments():
     parser.add_argument("--use_image_retrieval", action="store_true", help="Enable multimodal image retrieval.")
     parser.add_argument("--pdf_paths_file", type=str, default=None, help="Path to a JSON file containing PDF file paths for multimodal retrieval.")
     parser.add_argument("--use_pdf_retrieval", action="store_true", help="Enable multimodal PDF retrieval.")
+    parser.add_argument("--force_pdf_reparse", action="store_true", help="Force re-run MinerU parsing even if cached parsed outputs exist.")
     parser.add_argument("--max_qa_images", type=int, default=3, help="Max number of retrieved images injected into QA model input.")
+    parser.add_argument("--debug_num_questions", type=int, default=5, help="If >0, only evaluate the first N questions; set -1 for full evaluation.")
     return parser.parse_args()
 
 
@@ -85,10 +87,14 @@ def load_dataset(dataset_name, args):
         else:
             full_pdf_path_file = os.path.join(os.path.dirname(questions_path), args.pdf_paths_file)
 
-        pdf_data, pdf_images = load_pdf_documents(full_pdf_path_file)
+        pdf_data, pdf_images = load_pdf_documents(full_pdf_path_file, force_reparse=args.force_pdf_reparse)
         for doc in pdf_data:
-            for i, chunk in enumerate(split_text_into_chunks(doc["content"])):
-                passages.append(f"pdf:{os.path.basename(doc['path'])}:chunk{i}:{chunk}")
+            if doc.get("passages"):
+                passages.extend(doc["passages"])
+            else:
+                source_chunks = doc.get("xref_chunks") or split_text_into_chunks(doc["content"])
+                for i, chunk in enumerate(source_chunks):
+                    passages.append(f"pdf:{os.path.basename(doc['path'])}:chunk{i}:{chunk}")
         print(f"Loaded and parsed {len(pdf_data)} PDF docs, extracted {len(pdf_images)} images.")
 
     return questions, passages, images_data, pdf_data, pdf_images
@@ -116,10 +122,15 @@ def main():
         images_data.extend(pdf_images)
     effective_use_image_retrieval = args.use_image_retrieval or args.use_pdf_retrieval
 
-    # Keep original quick-debug behavior.
-    questions = questions[:5]
+    if args.debug_num_questions and args.debug_num_questions > 0:
+        questions = questions[: args.debug_num_questions]
     if args.use_pdf_retrieval and len(pdf_data) > 0:
-        pdf_passages = [p for p in passages if isinstance(p, str) and p.startswith("pdf:")]
+        pdf_passages = [
+            p
+            for p in passages
+            if (isinstance(p, str) and p.startswith("pdf:"))
+            or (isinstance(p, dict) and p.get("doc_id"))
+        ]
         passages = passages[:100] + pdf_passages
     else:
         passages = passages[:100]

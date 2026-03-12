@@ -1,5 +1,5 @@
 from src.embedding_store import EmbeddingStore
-from src.utils import min_max_normalize
+from src.utils import min_max_normalize, compute_mdhash_id
 import os
 import json
 from collections import defaultdict
@@ -13,6 +13,34 @@ import re
 import logging
 import torch
 from src.vision_encoder import VisionEncoder
+from src.doc_aware import (
+    build_doc_to_hash_ids,
+    detect_weak_parser_coverage,
+    infer_question_type,
+    normalize_doc_id,
+    parse_doc_id_from_question,
+    resolve_allowed_doc_hash_ids,
+)
+from src.pdf_structure_graph import (
+    build_pdf_structure_state,
+    infer_page_from_image_path,
+)
+from src.m3_lite import (
+    FIGURE_ROUTE,
+    GENERAL_ROUTE,
+    QUANT_ROUTE,
+    SUMMARY_ROUTE,
+    TITLE_ROUTE,
+    extract_first_figure_answer,
+    extract_quant_plus_figure_answer,
+    extract_summary_answer,
+    extract_summary_candidates,
+    extract_title_answer,
+    route_question_hybrid,
+    select_doc_passage_items,
+)
+from src.semantic_router import SemanticPrototypeRouter
+from src.task_eval import extract_gold_payload
 logger = logging.getLogger(__name__)
 
 
@@ -38,6 +66,16 @@ class LinearRAG:
         self.llm_model = self.config.llm_model
         self.spacy_ner = SpacyNER(self.config.spacy_model)
         self.graph = ig.Graph(directed=False)
+        self.passage_metadata_by_hash = {}
+        self.image_metadata_by_hash = {}
+        self.doc_to_passage_hash_ids = {}
+        self.doc_to_image_hash_ids = {}
+        self.pdf_structure_state = {}
+        self.semantic_router = SemanticPrototypeRouter(
+            self.config.embedding_model,
+            aggregation_mode=self.config.router_aggregation_mode,
+            confidence_threshold=self.config.router_semantic_threshold,
+        )
 
     def load_embedding_store(self):
         self.passage_embedding_store = EmbeddingStore(self.config.embedding_model, db_filename=os.path.join(self.config.working_dir,self.dataset_name, "passage_embedding.parquet"), batch_size=self.config.batch_size, namespace="passage")
@@ -61,9 +99,17 @@ class LinearRAG:
 
     def qa(self, questions):
         retrieval_results = self.retrieve(questions)
-        system_prompt = f"""As an advanced reading comprehension assistant, your task is to analyze text passages and corresponding questions meticulously. Your response start after "Thought: ", where you will methodically break down the reasoning process, illustrating how you arrive at conclusions. Conclude with "Answer: " to present a concise, definitive response, devoid of additional elaborations."""
+        system_prompt = (
+            "You are a precise QA assistant. "
+            "Use only the retrieved evidence to answer. "
+            "Output format must be exactly: Answer: <final answer>. "
+            "Do not output reasoning steps."
+        )
         all_messages = []
-        for retrieval_result in retrieval_results:
+        llm_result_indices = []
+        for idx, retrieval_result in enumerate(retrieval_results):
+            if retrieval_result.get("direct_answer") is not None:
+                continue
             question = retrieval_result["question"]
             sorted_passage = retrieval_result["sorted_passage"]
             retrieved_images = retrieval_result.get("retrieved_images", [])
@@ -74,7 +120,7 @@ class LinearRAG:
                 prompt_user += "Retrieved Images:\n"
                 for image_item in retrieved_images:
                     prompt_user += f"- {image_item['path']} (score={image_item['score']:.4f})\n"
-            prompt_user += f"Question: {question}\n Thought: "
+            prompt_user += f"Question: {question}\nPlease answer in one concise sentence.\n"
             image_paths = [item["path"] for item in retrieved_images[: self.config.max_qa_images]]
             messages = self.llm_model.build_qa_messages(
                 system_prompt=system_prompt,
@@ -82,18 +128,28 @@ class LinearRAG:
                 image_paths=image_paths,
             )
             all_messages.append(messages)
-        with ThreadPoolExecutor(max_workers=self.config.max_workers) as executor:
-            all_qa_results = list(tqdm(
-                executor.map(self.llm_model.infer, all_messages),
-                total=len(all_messages),
-                desc="QA Reading (Parallel)"
-            ))
+            llm_result_indices.append(idx)
+        all_qa_results = []
+        if all_messages:
+            with ThreadPoolExecutor(max_workers=self.config.max_workers) as executor:
+                all_qa_results = list(tqdm(
+                    executor.map(self.llm_model.infer, all_messages),
+                    total=len(all_messages),
+                    desc="QA Reading (Parallel)"
+                ))
 
-        for qa_result,question_info in zip(all_qa_results,retrieval_results):
-            try:
-                pred_ans = qa_result.split('Answer:')[1].strip()
-            except:
-                pred_ans = qa_result
+        llm_idx_to_result = {}
+        for qa_result, retrieval_idx in zip(all_qa_results, llm_result_indices):
+            llm_idx_to_result[retrieval_idx] = qa_result
+
+        for idx, question_info in enumerate(retrieval_results):
+            if question_info.get("direct_answer") is not None:
+                question_info["pred_answer"] = question_info["direct_answer"]
+                continue
+            qa_result = llm_idx_to_result[idx]
+            qa_text = qa_result.strip() if isinstance(qa_result, str) else str(qa_result)
+            m = re.search(r"(?:^|\\n)\\s*(?:Answer|答案)\\s*[:：]\\s*(.+)", qa_text, flags=re.IGNORECASE | re.DOTALL)
+            pred_ans = m.group(1).strip() if m else qa_text
             question_info["pred_answer"] = pred_ans
         return retrieval_results
         
@@ -128,42 +184,324 @@ class LinearRAG:
 
         retrieval_results = []
         for question_info in tqdm(questions, desc="Retrieving"):
-            question = question_info["question"]
+            raw_question = question_info["question"]
+            target_doc_id, question = parse_doc_id_from_question(raw_question)
+            question_type = infer_question_type(raw_question)
+            route_info = route_question_hybrid(
+                question,
+                semantic_router=self.semantic_router,
+                semantic_threshold=self.config.router_semantic_threshold,
+            )
+            predicted_route = route_info["predicted_route"]
+            route_source = route_info["route_source"]
+            route_confidence = route_info["route_confidence"]
+            top_route_scores = route_info["top_route_scores"]
+            matched_prototypes = route_info["matched_prototypes"]
+            logger.info(
+                "router_debug question=%s predicted_route=%s route_source=%s route_confidence=%.4f top_route_scores=%s matched_prototypes=%s",
+                raw_question,
+                predicted_route,
+                route_source,
+                route_confidence,
+                dict(list(top_route_scores.items())[:3]),
+                matched_prototypes[:3],
+            )
+            page_nodes_for_doc = self.pdf_structure_state.get("doc_to_page_nodes", {}).get(target_doc_id, []) if target_doc_id else []
+            structure_lookup_ok = bool(target_doc_id and page_nodes_for_doc)
+            logger.info(
+                "structure_lookup target_doc_id=%s success=%s pages=%d has_page_nodes=%s",
+                target_doc_id,
+                structure_lookup_ok,
+                len(page_nodes_for_doc),
+                bool(page_nodes_for_doc),
+            )
+            parser_coverage_warning = ""
+            if target_doc_id:
+                weak_coverage, weak_reason = detect_weak_parser_coverage(
+                    target_doc_id,
+                    self.pdf_structure_state.get("doc_to_page_nodes", {}),
+                    self.doc_to_image_hash_ids,
+                )
+                if weak_coverage:
+                    parser_coverage_warning = weak_reason
+                    logger.warning("parser_coverage target_doc_id=%s %s", target_doc_id, weak_reason)
             question_embedding = self.config.embedding_model.encode(question,normalize_embeddings=True,show_progress_bar=False,batch_size=self.config.batch_size)
             seed_entity_indices,seed_entities,seed_entity_hash_ids,seed_entity_scores = self.get_seed_entities(question)
-            if len(seed_entities) != 0:
+            allowed_passage_ids = resolve_allowed_doc_hash_ids(target_doc_id, self.passage_metadata_by_hash, self.doc_to_passage_hash_ids)
+            allowed_image_ids = resolve_allowed_doc_hash_ids(target_doc_id, self.image_metadata_by_hash, self.doc_to_image_hash_ids)
+            used_route = "dense_global"
+            evidence_pages = []
+            title_candidates = []
+            figure_token_candidates = []
+            summary_candidates = []
+            quant_candidates = []
+            chosen_quant_statement = ""
+            chosen_first_figure_token = ""
+            direct_answer = None
+            image_retrieval_skipped = False
+            image_retrieval_skipped_reason = ""
+
+            if target_doc_id and predicted_route == TITLE_ROUTE:
+                doc_items = select_doc_passage_items(self.passage_metadata_by_hash, target_doc_id)
+                front_items = [
+                    item for item in sorted(
+                        doc_items,
+                        key=lambda m: (
+                            m.get("page") if isinstance(m.get("page"), int) else 10**9,
+                            int(m.get("chunk_idx", 10**6)),
+                        ),
+                    )
+                    if (not isinstance(item.get("page"), int)) or item.get("page") <= 2
+                ]
+                direct_answer, title_candidates = extract_title_answer(front_items)
+                selected_items = front_items[: self.config.retrieval_top_k]
+                final_passage_hash_ids = [x["hash_id"] for x in selected_items]
+                final_passage_scores = [float(len(selected_items) - i) for i in range(len(selected_items))]
+                evidence_pages = sorted({x.get("page") for x in selected_items if isinstance(x.get("page"), int)})
+                used_route = TITLE_ROUTE
+            elif target_doc_id and predicted_route == FIGURE_ROUTE:
+                doc_items = select_doc_passage_items(self.passage_metadata_by_hash, target_doc_id)
+                direct_answer, figure_token_candidates = extract_first_figure_answer(doc_items)
+                chosen_first_figure_token = direct_answer
+                selected_items = []
+                seen = set()
+                for cand in figure_token_candidates:
+                    key = (cand.get("page"), cand.get("chunk_idx"))
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    match = next(
+                        (
+                            item for item in doc_items
+                            if item.get("page") == cand.get("page") and item.get("chunk_idx") == cand.get("chunk_idx")
+                        ),
+                        None,
+                    )
+                    if match is not None:
+                        selected_items.append(match)
+                    if len(selected_items) >= self.config.retrieval_top_k:
+                        break
+                final_passage_hash_ids = [x["hash_id"] for x in selected_items]
+                final_passage_scores = [float(len(selected_items) - i) for i in range(len(selected_items))]
+                evidence_pages = sorted({x.get("page") for x in selected_items if isinstance(x.get("page"), int)})
+                used_route = FIGURE_ROUTE
+            elif target_doc_id and predicted_route == QUANT_ROUTE:
+                doc_items = select_doc_passage_items(self.passage_metadata_by_hash, target_doc_id)
+                direct_answer, quant_candidates, chosen_quant_statement, chosen_first_figure_token, figure_token_candidates = extract_quant_plus_figure_answer(doc_items)
+                selected_items = []
+                seen = set()
+                for cand in figure_token_candidates[:3]:
+                    key = (cand.get("page"), cand.get("chunk_idx"))
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    match = next(
+                        (
+                            item for item in doc_items
+                            if item.get("page") == cand.get("page") and item.get("chunk_idx") == cand.get("chunk_idx")
+                        ),
+                        None,
+                    )
+                    if match is not None:
+                        selected_items.append(match)
+                for cand in quant_candidates[:3]:
+                    key = (cand.get("page"), cand.get("chunk_idx"))
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    match = next(
+                        (
+                            item for item in doc_items
+                            if item.get("page") == cand.get("page") and item.get("chunk_idx") == cand.get("chunk_idx")
+                        ),
+                        None,
+                    )
+                    if match is not None:
+                        selected_items.append(match)
+                final_passage_hash_ids = [x["hash_id"] for x in selected_items[: self.config.retrieval_top_k]]
+                final_passage_scores = [float(len(final_passage_hash_ids) - i) for i in range(len(final_passage_hash_ids))]
+                evidence_pages = sorted({x.get("page") for x in selected_items if isinstance(x.get("page"), int)})
+                used_route = QUANT_ROUTE
+            elif target_doc_id and predicted_route == SUMMARY_ROUTE:
+                doc_items = select_doc_passage_items(self.passage_metadata_by_hash, target_doc_id)
+                direct_answer, summary_candidates = extract_summary_answer(doc_items)
+                selected_items = []
+                for cand in summary_candidates[: self.config.retrieval_top_k]:
+                    match = next(
+                        (
+                            item for item in doc_items
+                            if item.get("page") == cand.get("page") and item.get("chunk_idx") == cand.get("chunk_idx")
+                        ),
+                        None,
+                    )
+                    if match is not None:
+                        selected_items.append(match)
+                final_passage_hash_ids = [x["hash_id"] for x in selected_items]
+                final_passage_scores = [float(len(selected_items) - i) for i in range(len(selected_items))]
+                evidence_pages = sorted({x.get("page") for x in selected_items if isinstance(x.get("page"), int)})
+                used_route = SUMMARY_ROUTE
+            elif target_doc_id:
+                sorted_passage_indices,sorted_passage_scores = self.dense_passage_retrieval(
+                    question_embedding, allowed_passage_ids=allowed_passage_ids
+                )
+                if question_type in {"title", "summary"}:
+                    page_candidates = self.collect_top_candidate_pages(sorted_passage_indices[: max(self.config.retrieval_top_k * 4, 10)])
+                    logger.info("debug_structure title_or_summary target=%s top_page_candidates=%s", target_doc_id, page_candidates[:5])
+                if question_type in {"first_figure_token", "quant_plus_first_figure"}:
+                    anchor_pages = self.get_earliest_anchor_pages(target_doc_id)
+                    logger.info("debug_structure first_figure target=%s earliest_anchor_pages=%s", target_doc_id, anchor_pages[:5])
+                rerank_pool = max(self.config.retrieval_top_k * 4, self.config.retrieval_top_k)
+                pool_indices = sorted_passage_indices[:rerank_pool]
+                pool_hash_ids = [self.passage_embedding_store.hash_ids[idx] for idx in pool_indices]
+                pool_scores = sorted_passage_scores[:rerank_pool]
+                final_passage_hash_ids, final_passage_scores = self.rerank_passages_with_structure(
+                    pool_hash_ids, pool_scores, question_type
+                )
+                final_passage_hash_ids = final_passage_hash_ids[:self.config.retrieval_top_k]
+                final_passage_scores = final_passage_scores[:self.config.retrieval_top_k]
+                used_route = "doc_aware_dense"
+            elif len(seed_entities) != 0:
                 sorted_passage_hash_ids,sorted_passage_scores = self.graph_search_with_seed_entities(question_embedding,seed_entity_indices,seed_entities,seed_entity_hash_ids,seed_entity_scores)
                 final_passage_hash_ids = sorted_passage_hash_ids[:self.config.retrieval_top_k]
                 final_passage_scores = sorted_passage_scores[:self.config.retrieval_top_k]
-                final_passages = [self.passage_embedding_store.hash_id_to_text[passage_hash_id] for passage_hash_id in final_passage_hash_ids]
+                used_route = "graph_seed"
             else:
                 sorted_passage_indices,sorted_passage_scores = self.dense_passage_retrieval(question_embedding)
                 final_passage_indices = sorted_passage_indices[:self.config.retrieval_top_k]
                 final_passage_hash_ids = [self.passage_embedding_store.hash_ids[idx] for idx in final_passage_indices]
                 final_passage_scores = sorted_passage_scores[:self.config.retrieval_top_k]
-                final_passages = [self.passage_embedding_store.texts[idx] for idx in final_passage_indices]
+                used_route = "dense_global"
+            final_passages = [self.get_display_passage_text(hid) for hid in final_passage_hash_ids]
 
             retrieved_images = []
-            if self.config.use_image_retrieval:
-                image_indices, image_scores = self.dense_image_retrieval(question)
-                top_img_k = self.config.retrieval_top_k_image
-                for img_idx, img_score in zip(image_indices[:top_img_k], image_scores[:top_img_k]):
-                    retrieved_images.append({
-                        "path": self.image_embedding_store.texts[img_idx],
-                        "score": float(img_score)
-                    })
-                final_passage_hash_ids, final_passages, final_passage_scores = self.fuse_passage_with_images(
-                    final_passage_hash_ids, final_passages, final_passage_scores, retrieved_images
-                )
+            if self.config.use_image_retrieval and predicted_route == GENERAL_ROUTE:
+                if target_doc_id and allowed_image_ids == []:
+                    image_retrieval_skipped = True
+                    image_retrieval_skipped_reason = "target_doc_has_no_indexed_images"
+                    logger.info("image_retrieval skipped target_doc_id=%s reason=%s", target_doc_id, image_retrieval_skipped_reason)
+                else:
+                    image_indices, image_scores = self.dense_image_retrieval(question, allowed_image_ids=allowed_image_ids)
+                    top_img_k = self.config.retrieval_top_k_image
+                    for img_idx, img_score in zip(image_indices[:top_img_k], image_scores[:top_img_k]):
+                        image_hash_id = self.image_embedding_store.hash_ids[img_idx]
+                        image_meta = self.image_metadata_by_hash.get(image_hash_id, {})
+                        image_doc_id = normalize_doc_id(image_meta.get("doc_id", ""))
+                        if target_doc_id and image_doc_id != target_doc_id:
+                            continue
+                        retrieved_images.append({
+                            "hash_id": image_hash_id,
+                            "path": self.image_embedding_store.texts[img_idx],
+                            "score": float(img_score),
+                            "doc_id": image_doc_id,
+                        })
+                    final_passage_hash_ids, final_passages, final_passage_scores = self.fuse_passage_with_images(
+                        final_passage_hash_ids, final_passages, final_passage_scores, retrieved_images
+                    )
+
+            top_passage_doc_ids = [self.passage_metadata_by_hash.get(hid, {}).get("doc_id", "") for hid in final_passage_hash_ids]
+            top_image_doc_ids = [item.get("doc_id", "") for item in retrieved_images[: self.config.retrieval_top_k_image]]
+            if target_doc_id and top_passage_doc_ids and any(doc_id != target_doc_id for doc_id in top_passage_doc_ids):
+                logger.warning("doc_hint mismatch passages: target=%s, top_docs=%s", target_doc_id, top_passage_doc_ids)
+            if target_doc_id and top_image_doc_ids and any(doc_id != target_doc_id for doc_id in top_image_doc_ids if doc_id):
+                logger.warning("doc_hint mismatch images: target=%s, top_docs=%s", target_doc_id, top_image_doc_ids)
+
             result = {
-                "question": question,
+                "question": raw_question,
                 "sorted_passage": final_passages,
                 "sorted_passage_scores": final_passage_scores,
                 "retrieved_images": retrieved_images,
-                "gold_answer": question_info["answer"]
+                "gold_answer": extract_gold_payload(question_info),
+                "target_doc_id": target_doc_id,
+                "question_type": question_type,
+                "predicted_route": predicted_route,
+                "route_source": route_source,
+                "route_confidence": route_confidence,
+                "top_route_scores": top_route_scores,
+                "matched_prototypes": matched_prototypes,
+                "used_route": used_route,
+                "seed_entities": seed_entities,
+                "top_passage_doc_ids": top_passage_doc_ids,
+                "top_image_doc_ids": top_image_doc_ids,
+                "evidence_pages": evidence_pages,
+                "title_candidates": title_candidates,
+                "figure_token_candidates": figure_token_candidates,
+                "summary_candidates": summary_candidates,
+                "quant_candidates": quant_candidates,
+                "chosen_quant_statement": chosen_quant_statement,
+                "chosen_first_figure_token": chosen_first_figure_token,
+                "image_retrieval_skipped": image_retrieval_skipped,
+                "image_retrieval_skipped_reason": image_retrieval_skipped_reason,
+                "parser_coverage_warning": parser_coverage_warning,
+                "direct_answer": direct_answer,
             }
             retrieval_results.append(result)
         return retrieval_results
+
+    def get_display_passage_text(self, passage_hash_id):
+        meta = self.passage_metadata_by_hash.get(passage_hash_id, {})
+        if meta and meta.get("display_text"):
+            return meta["display_text"]
+        return self.passage_embedding_store.hash_id_to_text.get(passage_hash_id, "")
+
+    def collect_top_candidate_pages(self, passage_indices):
+        page_count = defaultdict(int)
+        for idx in passage_indices:
+            if idx < 0 or idx >= len(self.passage_hash_ids):
+                continue
+            hid = self.passage_hash_ids[idx]
+            page = self.passage_metadata_by_hash.get(hid, {}).get("page")
+            if isinstance(page, int):
+                page_count[page] += 1
+        return sorted(page_count.items(), key=lambda x: (-x[1], x[0]))
+
+    def get_earliest_anchor_pages(self, doc_id):
+        doc_id = normalize_doc_id(doc_id)
+        if not doc_id:
+            return []
+        pages = set()
+        for meta in self.passage_metadata_by_hash.values():
+            if normalize_doc_id(meta.get("doc_id", "")) != doc_id:
+                continue
+            anchors = meta.get("anchors") or []
+            page = meta.get("page")
+            text = meta.get("text_for_embed", "") or ""
+            has_token_ref = bool(re.search(r"\b(?:fig(?:ure)?\.?|table)\s*\d+[A-Za-z]?\b", text, flags=re.IGNORECASE))
+            if (anchors or has_token_ref) and isinstance(page, int):
+                pages.add(page)
+        return sorted(pages)
+
+    def rerank_passages_with_structure(self, passage_hash_ids, passage_scores, question_type):
+        if not passage_hash_ids:
+            return [], []
+        score_map = {}
+        top_anchor = set(passage_hash_ids[:3])
+        for hid, dense_score in zip(passage_hash_ids, passage_scores):
+            meta = self.passage_metadata_by_hash.get(hid, {})
+            score = float(dense_score)
+            page = meta.get("page")
+            anchors = meta.get("anchors") or []
+            # Lightweight priors for structure-sensitive question styles.
+            if question_type in {"title", "summary"} and isinstance(page, int):
+                if page <= 2:
+                    score += 0.08
+                elif page <= 4:
+                    score += 0.03
+            if question_type in {"first_figure_token", "quant_plus_first_figure"} and anchors:
+                score += 0.08
+            # Preserve local continuity around very top dense passages.
+            if hid not in top_anchor and self.is_adjacent_to_any(hid, top_anchor):
+                score += 0.04
+            score_map[hid] = score
+        sorted_items = sorted(score_map.items(), key=lambda x: x[1], reverse=True)
+        return [x[0] for x in sorted_items], [x[1] for x in sorted_items]
+
+    def is_adjacent_to_any(self, passage_hash_id, other_passage_hash_ids):
+        if not other_passage_hash_ids:
+            return False
+        neighbors = self.pdf_structure_state.get("passage_adjacent_map", {}).get(passage_hash_id, set())
+        if not neighbors:
+            return False
+        return any(x in neighbors for x in other_passage_hash_ids)
 
     def fuse_passage_with_images(self, passage_hash_ids, passages, passage_scores, retrieved_images):
         if not passage_hash_ids or not retrieved_images:
@@ -172,32 +510,21 @@ class LinearRAG:
         score_map = {hid: float(score) for hid, score in zip(passage_hash_ids, passage_scores)}
         # Boost passages when top retrieved image likely comes from the same PDF.
         for item in retrieved_images:
-            image_path = item["path"]
             image_score = item["score"]
-            pdf_identifier = self.extract_pdf_identifier_from_image_path(image_path)
+            pdf_identifier = item.get("doc_id", "")
             if not pdf_identifier:
                 continue
             for hid in passage_hash_ids:
-                text = self.passage_embedding_store.hash_id_to_text.get(hid, "")
-                if f"pdf:{pdf_identifier}:" in text:
+                passage_doc_id = self.passage_metadata_by_hash.get(hid, {}).get("doc_id", "")
+                if passage_doc_id == pdf_identifier:
                     score_map[hid] += self.config.image_ratio * image_score
 
         sorted_items = sorted(score_map.items(), key=lambda x: x[1], reverse=True)
         sorted_hash_ids = [hid for hid, _ in sorted_items]
         sorted_scores = [score for _, score in sorted_items]
-        sorted_passages = [self.passage_embedding_store.hash_id_to_text[hid] for hid in sorted_hash_ids]
+        sorted_passages = [self.get_display_passage_text(hid) for hid in sorted_hash_ids]
         return sorted_hash_ids, sorted_passages, sorted_scores
 
-    @staticmethod
-    def extract_pdf_identifier_from_image_path(image_path):
-        # image_output_dir uses "import/pdf_images/<pdf_basename>/...", where basename includes ".pdf"
-        norm_path = os.path.normpath(image_path)
-        parts = norm_path.split(os.sep)
-        if len(parts) < 2:
-            return ""
-        parent = parts[-2]
-        return parent.strip()
-    
     def _precompute_sparse_matrices(self):
         """
         Precompute and cache sparse adjacency matrices for efficient vectorized retrieval using PyTorch.
@@ -569,18 +896,43 @@ class LinearRAG:
             passage_weights[passage_node_idx] = passage_score * self.config.passage_node_weight
         return passage_weights
 
-    def dense_passage_retrieval(self, question_embedding):
+    def dense_passage_retrieval(self, question_embedding, allowed_passage_ids=None):
         question_emb = question_embedding.reshape(1, -1)
+        if allowed_passage_ids:
+            allowed_set = set(allowed_passage_ids)
+            allowed_indices = [i for i, hid in enumerate(self.passage_hash_ids) if hid in allowed_set]
+            if not allowed_indices:
+                return np.array([], dtype=np.int64), []
+            allowed_embs = self.passage_embeddings[allowed_indices]
+            similarities = np.dot(allowed_embs, question_emb.T).flatten()
+            local_sorted = np.argsort(similarities)[::-1]
+            sorted_passage_indices = np.array([allowed_indices[i] for i in local_sorted], dtype=np.int64)
+            sorted_passage_scores = similarities[local_sorted].tolist()
+            return sorted_passage_indices, sorted_passage_scores
+
         question_passage_similarities = np.dot(self.passage_embeddings, question_emb.T).flatten()
         sorted_passage_indices = np.argsort(question_passage_similarities)[::-1]
         sorted_passage_scores = question_passage_similarities[sorted_passage_indices].tolist()
         return sorted_passage_indices, sorted_passage_scores
 
-    def dense_image_retrieval(self, question):
+    def dense_image_retrieval(self, question, allowed_image_ids=None):
         if len(self.image_embeddings) == 0:
             return np.array([], dtype=np.int64), []
         question_image_embedding = self.vision_encoder.encode_text(question, normalize_embeddings=True)[0]
         question_image_embedding = question_image_embedding.reshape(1, -1)
+
+        if allowed_image_ids is not None:
+            allowed_set = set(allowed_image_ids)
+            allowed_indices = [i for i, hid in enumerate(self.image_hash_ids) if hid in allowed_set]
+            if not allowed_indices:
+                return np.array([], dtype=np.int64), []
+            allowed_embs = self.image_embeddings[allowed_indices]
+            similarities = np.dot(allowed_embs, question_image_embedding.T).flatten()
+            local_sorted = np.argsort(similarities)[::-1]
+            sorted_image_indices = np.array([allowed_indices[i] for i in local_sorted], dtype=np.int64)
+            sorted_image_scores = similarities[local_sorted].tolist()
+            return sorted_image_indices, sorted_image_scores
+
         image_similarities = np.dot(self.image_embeddings, question_image_embedding.T).flatten()
         sorted_image_indices = np.argsort(image_similarities)[::-1]
         sorted_image_scores = image_similarities[sorted_image_indices].tolist()
@@ -611,16 +963,80 @@ class LinearRAG:
     def index(self, passages, images_data, pdf_data):
         self.node_to_node_stats = defaultdict(dict)
         self.entity_to_sentence_stats = defaultdict(dict)
-        
-        # 1. 文本索引
-        self.passage_embedding_store.insert_text(passages)
-        
-        # 2. 图像索引 (多模态)
+        self.passage_metadata_by_hash = {}
+        self.image_metadata_by_hash = {}
+
+        passage_texts_for_embed = []
+        passage_item_ids = []
+        for idx, item in enumerate(passages):
+            if isinstance(item, dict) and item.get("passage_id"):
+                passage_item_ids.append(item["passage_id"])
+                passage_texts_for_embed.append(item.get("text_for_embed", item.get("display_text", "")))
+            else:
+                passage_item_ids.append(f"legacy:{idx}")
+                passage_texts_for_embed.append(str(item))
+
+        self.passage_embedding_store.insert_text(passage_texts_for_embed, item_ids=passage_item_ids)
+
+        for idx, item in enumerate(passages):
+            if isinstance(item, dict) and item.get("passage_id"):
+                passage_id = item["passage_id"]
+                passage_hash_id = compute_mdhash_id(str(passage_id), prefix="passage-")
+                self.passage_metadata_by_hash[passage_hash_id] = {
+                    "passage_id": passage_id,
+                    "doc_id": normalize_doc_id(item.get("doc_id", "")),
+                    "page": item.get("page"),
+                    "chunk_idx": item.get("chunk_idx", idx),
+                    "block_type": item.get("block_type", "text"),
+                    "anchors": item.get("anchors", []),
+                    "display_text": item.get("display_text", ""),
+                    "text_for_embed": item.get("text_for_embed", ""),
+                }
+            else:
+                passage_hash_id = compute_mdhash_id(f"legacy:{idx}", prefix="passage-")
+                text = str(item)
+                self.passage_metadata_by_hash[passage_hash_id] = {
+                    "passage_id": f"legacy:{idx}",
+                    "doc_id": "",
+                    "page": None,
+                    "chunk_idx": idx,
+                    "block_type": "legacy",
+                    "anchors": [],
+                    "display_text": text,
+                    "text_for_embed": text,
+                }
+
         if self.config.use_image_retrieval and len(images_data) > 0:
             logger.info(f"正在索引 {len(images_data)} 张图像...")
-            # images_data 格式: [{"path": "..."}, ...]
             image_paths = [img["path"] for img in images_data]
-            self.image_embedding_store.insert_image(image_paths)
+            image_item_ids = [img.get("image_id", f"img:{i}") for i, img in enumerate(images_data)]
+            self.image_embedding_store.insert_image(image_paths, item_ids=image_item_ids)
+            for i, img in enumerate(images_data):
+                image_hash_id = compute_mdhash_id(str(image_item_ids[i]), prefix="image-")
+                self.image_metadata_by_hash[image_hash_id] = {
+                    "image_id": image_item_ids[i],
+                    "doc_id": normalize_doc_id(img.get("doc_id") or img.get("source_pdf") or ""),
+                    "page": img.get("page"),
+                    "path": img.get("path", ""),
+                    "caption_hint": img.get("caption_hint"),
+                    "source_pdf": img.get("source_pdf"),
+                }
+
+        self.doc_to_passage_hash_ids = build_doc_to_hash_ids(self.passage_metadata_by_hash)
+        self.doc_to_image_hash_ids = build_doc_to_hash_ids(self.image_metadata_by_hash)
+        self.pdf_structure_state = build_pdf_structure_state(
+            pdf_data=pdf_data,
+            passage_metadata_by_hash=self.passage_metadata_by_hash,
+            image_metadata_by_hash=self.image_metadata_by_hash,
+            infer_page_fn=infer_page_from_image_path,
+        )
+        os.makedirs(os.path.join(self.config.working_dir, self.dataset_name), exist_ok=True)
+        with open(os.path.join(self.config.working_dir, self.dataset_name, "passage_metadata.json"), "w", encoding="utf-8") as f:
+            json.dump(self.passage_metadata_by_hash, f, ensure_ascii=False, indent=2)
+        with open(os.path.join(self.config.working_dir, self.dataset_name, "image_metadata.json"), "w", encoding="utf-8") as f:
+            json.dump(self.image_metadata_by_hash, f, ensure_ascii=False, indent=2)
+        with open(os.path.join(self.config.working_dir, self.dataset_name, "pdf_structure_state.json"), "w", encoding="utf-8") as f:
+            json.dump(self._jsonable_structure_state(), f, ensure_ascii=False, indent=2)
 
         hash_id_to_passage = self.passage_embedding_store.get_hash_id_to_text()
         existing_passage_hash_id_to_entities,existing_sentence_to_entities, new_passage_hash_ids = self.load_existing_data(hash_id_to_passage.keys())
@@ -642,24 +1058,53 @@ class LinearRAG:
             self.sentence_hash_id_to_entity_hash_ids[sentence_hash_id] = [self.entity_embedding_store.text_to_hash_id[e] for e in entities]
         self.add_entity_to_passage_edges(passage_hash_id_to_entities)
         self.add_adjacent_passage_edges()
+        self.add_pdf_structure_edges()
         self.augment_graph()
         output_graphml_path = os.path.join(self.config.working_dir,self.dataset_name, "LinearRAG.graphml")
         os.makedirs(os.path.dirname(output_graphml_path), exist_ok=True)   
         self.graph.write_graphml(output_graphml_path)
 
     def add_adjacent_passage_edges(self):
-        passage_id_to_text = self.passage_embedding_store.get_hash_id_to_text()
-        index_pattern = re.compile(r'^(\d+):')
-        indexed_items = [
-            (int(match.group(1)), node_key)
-            for node_key, text in passage_id_to_text.items()
-            if (match := index_pattern.match(text.strip()))
-        ]
-        indexed_items.sort(key=lambda x: x[0])
-        for i in range(len(indexed_items) - 1):
-            current_node = indexed_items[i][1]
-            next_node = indexed_items[i + 1][1]
-            self.node_to_node_stats[current_node][next_node] = 1.0
+        # Prefer explicit metadata order for PDF passages.
+        doc_to_items = defaultdict(list)
+        legacy_items = []
+        for hid, meta in self.passage_metadata_by_hash.items():
+            doc_id = meta.get("doc_id") or ""
+            page = meta.get("page")
+            chunk_idx = meta.get("chunk_idx", 0)
+            if doc_id:
+                page_order = page if isinstance(page, int) else 10**9
+                doc_to_items[doc_id].append((page_order, int(chunk_idx), hid))
+            else:
+                legacy_items.append((int(chunk_idx), hid))
+
+        for items in doc_to_items.values():
+            items.sort(key=lambda x: (x[0], x[1]))
+            for i in range(len(items) - 1):
+                u = items[i][2]
+                v = items[i + 1][2]
+                self.node_to_node_stats[u][v] = max(self.node_to_node_stats[u].get(v, 0.0), 0.35)
+
+        # Legacy fallback for non-PDF datasets.
+        legacy_items.sort(key=lambda x: x[0])
+        for i in range(len(legacy_items) - 1):
+            u = legacy_items[i][1]
+            v = legacy_items[i + 1][1]
+            self.node_to_node_stats[u][v] = max(self.node_to_node_stats[u].get(v, 0.0), 1.0)
+
+    def add_pdf_structure_edges(self):
+        for u, v, edge_type, weight in self.pdf_structure_state.get("edges", []):
+            if u == v:
+                continue
+            self.node_to_node_stats[u][v] = max(self.node_to_node_stats[u].get(v, 0.0), float(weight))
+
+    def _jsonable_structure_state(self):
+        out = dict(self.pdf_structure_state)
+        if "passage_adjacent_map" in out:
+            out["passage_adjacent_map"] = {
+                k: sorted(list(v)) for k, v in out["passage_adjacent_map"].items()
+            }
+        return out
 
     def augment_graph(self):
         self.add_nodes()
@@ -669,13 +1114,51 @@ class LinearRAG:
         existing_nodes = {v["name"]: v for v in self.graph.vs if "name" in v.attributes()} 
         entity_hash_id_to_text = self.entity_embedding_store.get_hash_id_to_text()
         passage_hash_id_to_text = self.passage_embedding_store.get_hash_id_to_text()
+        image_hash_id_to_text = {}
+        if self.config.use_image_retrieval and hasattr(self, "image_embedding_store"):
+            image_hash_id_to_text = self.image_embedding_store.get_hash_id_to_text()
         all_hash_id_to_text = {**entity_hash_id_to_text, **passage_hash_id_to_text}
         
         passage_hash_ids = set(passage_hash_id_to_text.keys())
+        image_hash_ids = set(image_hash_id_to_text.keys())
         
         for hash_id, text in all_hash_id_to_text.items():
             if hash_id not in existing_nodes:
-                self.graph.add_vertex(name=hash_id, content=text)
+                node_type = "passage" if hash_id in passage_hash_ids else "entity"
+                self.graph.add_vertex(name=hash_id, content=text, node_type=node_type)
+        for hash_id, text in image_hash_id_to_text.items():
+            if hash_id not in existing_nodes:
+                image_meta = self.image_metadata_by_hash.get(hash_id, {})
+                self.graph.add_vertex(
+                    name=hash_id,
+                    content=text,
+                    node_type="image",
+                    doc_id=image_meta.get("doc_id", ""),
+                    page=image_meta.get("page"),
+                )
+
+        # Add explicit structure nodes (page / visual).
+        for page_node_id, page_meta in self.pdf_structure_state.get("page_nodes", {}).items():
+            if page_node_id in existing_nodes:
+                continue
+            self.graph.add_vertex(
+                name=page_node_id,
+                content=f"[PAGE] {page_meta.get('doc_id', '')} p{page_meta.get('page', '')}",
+                node_type="page",
+                doc_id=page_meta.get("doc_id", ""),
+                page=page_meta.get("page"),
+                is_front_matter=bool(page_meta.get("is_front_matter", False)),
+            )
+        for visual_node_id, visual_meta in self.pdf_structure_state.get("visual_nodes", {}).items():
+            if visual_node_id in existing_nodes:
+                continue
+            self.graph.add_vertex(
+                name=visual_node_id,
+                content=f"[VISUAL_REF] {visual_meta.get('anchor', '')}",
+                node_type="visual",
+                doc_id=visual_meta.get("doc_id", ""),
+                anchor=visual_meta.get("anchor", ""),
+            )
         
         self.node_name_to_vertex_idx = {v["name"]: v.index for v in self.graph.vs if "name" in v.attributes()}   
         self.passage_node_indices = [
@@ -685,15 +1168,17 @@ class LinearRAG:
         ]
 
     def add_edges(self):
-        edges = []
-        weights = []
-        
+        edge_weight_map = {}
         for node_hash_id, node_to_node_stats in self.node_to_node_stats.items():
             for neighbor_hash_id, weight in node_to_node_stats.items():
                 if node_hash_id == neighbor_hash_id:
                     continue
-                edges.append((node_hash_id, neighbor_hash_id))
-                weights.append(weight)
+                u, v = sorted([node_hash_id, neighbor_hash_id])
+                edge_weight_map[(u, v)] = max(edge_weight_map.get((u, v), 0.0), float(weight))
+        edges = list(edge_weight_map.keys())
+        weights = [edge_weight_map[e] for e in edges]
+        if not edges:
+            return
         self.graph.add_edges(edges)
         self.graph.es['weight'] = weights
 
@@ -736,3 +1221,40 @@ class LinearRAG:
     def save_ner_results(self, existing_passage_hash_id_to_entities, existing_sentence_to_entities):
         with open(self.ner_results_path, "w") as f:
             json.dump({"passage_hash_id_to_entities": existing_passage_hash_id_to_entities, "sentence_to_entities": existing_sentence_to_entities}, f)
+
+    def inspect_doc_structure(self, doc_id, max_pages=5):
+        doc_id = normalize_doc_id(doc_id)
+        if not doc_id:
+            return {"doc_id": "", "pages": [], "passage_links": [], "visual_links": []}
+        page_nodes = self.pdf_structure_state.get("doc_to_page_nodes", {}).get(doc_id, [])
+        page_nodes = page_nodes[:max_pages]
+        page_meta = self.pdf_structure_state.get("page_nodes", {})
+        out_pages = [page_meta.get(pid, {}) for pid in page_nodes]
+        passage_links = []
+        visual_links = []
+        for u, v, etype, weight in self.pdf_structure_state.get("edges", []):
+            if etype == "passage_page" and v in page_nodes:
+                passage_links.append({"passage": u, "page_node": v, "weight": weight})
+            if etype in {"passage_visual", "visual_page"}:
+                v_doc = ""
+                if v.startswith("visual::"):
+                    v_doc = v.split("::", 2)[1]
+                elif u.startswith("visual::"):
+                    v_doc = u.split("::", 2)[1]
+                if v_doc == doc_id:
+                    visual_links.append({"src": u, "dst": v, "edge_type": etype, "weight": weight})
+        return {
+            "doc_id": doc_id,
+            "pages": out_pages,
+            "passage_links": passage_links[:30],
+            "visual_links": visual_links[:30],
+        }
+
+    def inspect_question_structure(self, question, max_pages=5):
+        target_doc_id, cleaned_question = parse_doc_id_from_question(question or "")
+        return {
+            "question": cleaned_question,
+            "target_doc_id": target_doc_id,
+            "question_type": infer_question_type(question or ""),
+            "doc_structure": self.inspect_doc_structure(target_doc_id, max_pages=max_pages),
+        }
