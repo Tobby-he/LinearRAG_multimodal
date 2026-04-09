@@ -1,3 +1,4 @@
+import logging
 import sys
 from pathlib import Path
 
@@ -11,6 +12,7 @@ from src.doc_aware import (
     is_clean_text_for_embed,
     normalize_doc_id,
     parse_doc_id_from_question,
+    resolve_question_type,
 )
 
 
@@ -61,3 +63,26 @@ def test_normalize_doc_id_variants_resolve_to_same_id():
     for v in variants:
         assert normalize_doc_id(v) == expected
     assert derive_doc_id_from_pdf_path(r"E:\dataset\pmc_pdf\PMC466956\sciadv.adp1439.PMC466956.pdf") == expected
+
+
+def test_resolve_question_type_prefers_dataset_label():
+    question_info = {
+        "question": "Please answer freely.",
+        "question_type": "title",
+    }
+    assert resolve_question_type(question_info, question_info["question"]) == "title"
+    assert resolve_question_type({"question": "According to Fig. 2, how many studies were identified?", "question_type": "chart_numeric"}, "According to Fig. 2, how many studies were identified?") == "chart_numeric"
+
+
+def test_resolve_question_type_falls_back_when_missing_or_empty():
+    raw_question = "What is the exact full paper title?"
+    assert resolve_question_type({}, raw_question) == "title"
+    assert resolve_question_type({"question_type": ""}, raw_question) == "title"
+
+
+def test_resolve_question_type_logs_and_falls_back_for_invalid_label(caplog):
+    raw_question = "What is the exact full paper title?"
+    with caplog.at_level("WARNING"):
+        resolved = resolve_question_type({"question_type": "numeric"}, raw_question, logger=logging.getLogger("test"))
+    assert resolved == "title"
+    assert "question_type fallback reason=invalid" in caplog.text

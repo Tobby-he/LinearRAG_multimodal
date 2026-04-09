@@ -126,6 +126,7 @@ class Evaluator:
         logger.info(f"  Quant Token Match: {task_metrics['quant_token_match']:.4f}")
         logger.info(f"  Quant Token F1: {task_metrics['quant_token_f1']:.4f}")
         logger.info(f"  Quant Canonical Answer EM: {task_metrics['quant_canonical_answer_em']:.4f}")
+        logger.info(f"  Chart Numeric EM: {task_metrics['chart_numeric_em']:.4f}")
         with open(self.predictions_path, "w", encoding="utf-8") as f:
             json.dump(self.prediction_results, f, ensure_ascii=False, indent=4)
         

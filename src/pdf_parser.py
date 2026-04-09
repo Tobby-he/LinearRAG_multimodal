@@ -1,4 +1,4 @@
-﻿import glob
+import glob
 import json
 import os
 import re
@@ -221,14 +221,6 @@ def _build_passage_records_from_content_data(data, doc_id: str) -> List[PassageR
                 next_ = page_anchors.get(page + 1, [])[:2]
                 anchors = local + prev_ + next_
             passage_id = f"{doc_id}:p{page if page is not None else 'na'}:c{chunk_idx}"
-            display_prefix = f"[PDF_META doc={doc_id}"
-            if page is not None:
-                display_prefix += f" | page={page}"
-            if item_type:
-                display_prefix += f" | type={item_type}"
-            if anchors:
-                display_prefix += f" | anchors={','.join(anchors)}"
-            display_prefix += "] "
             records.append(
                 PassageRecord(
                     passage_id=passage_id,
@@ -238,7 +230,7 @@ def _build_passage_records_from_content_data(data, doc_id: str) -> List[PassageR
                     block_type=item_type or "text",
                     anchors=anchors,
                     text_for_embed=piece,
-                    display_text=display_prefix + piece,
+                    display_text=piece,
                 )
             )
             chunk_idx += 1
@@ -274,13 +266,6 @@ def _build_passage_records_from_md(md_text: str, doc_id: str) -> List[PassageRec
         for p in parts:
             anchors = [f"ref:{a}" for a in FIGURE_ANCHOR_RE.findall(p)][:5]
             passage_id = f"{doc_id}:p{current_page if current_page is not None else 'na'}:c{chunk_idx}"
-            prefix = f"[PDF_META doc={doc_id}"
-            if current_page is not None:
-                prefix += f" | page={current_page}"
-            prefix += " | type=md"
-            if anchors:
-                prefix += f" | anchors={','.join(anchors)}"
-            prefix += "] "
             records.append(
                 PassageRecord(
                     passage_id=passage_id,
@@ -290,7 +275,7 @@ def _build_passage_records_from_md(md_text: str, doc_id: str) -> List[PassageRec
                     block_type="md",
                     anchors=anchors,
                     text_for_embed=p,
-                    display_text=prefix + p,
+                    display_text=p,
                 )
             )
             chunk_idx += 1
@@ -422,7 +407,7 @@ def parse_pdf_with_mineru(
                     block_type="text",
                     anchors=[],
                     text_for_embed=part,
-                    display_text=f"[PDF_META doc={doc_id} | type=text] {part}",
+                    display_text=part,
                 )
             )
 

@@ -16,7 +16,7 @@ def extract_gold_answer_text(gold_answer, question_type=""):
     if isinstance(gold_answer, dict):
         if question_type == "summary":
             return gold_answer.get("summary_one_sentence") or gold_answer.get("canonical_answer", "")
-        if question_type == "quant_plus_first_figure":
+        if question_type in {"quant_plus_first_figure", "chart_numeric"}:
             return gold_answer.get("canonical_answer", "")
         return gold_answer.get("canonical_answer") or gold_answer.get("title") or gold_answer.get("token") or ""
     return gold_answer or ""
@@ -53,6 +53,7 @@ def compute_task_metrics(predictions):
     quant_token_match_scores = []
     quant_token_f1_scores = []
     quant_canonical_em_scores = []
+    chart_numeric_scores = []
 
     for pred in predictions:
         qtype = pred.get("question_type", "")
@@ -79,6 +80,10 @@ def compute_task_metrics(predictions):
             quant_token_match_scores.append(metrics["token_match"])
             quant_token_f1_scores.append(metrics["quant_token_f1"])
             quant_canonical_em_scores.append(metrics["canonical_answer_em"])
+        elif qtype == "chart_numeric":
+            score = exact_match_score(pred_answer, gold_text)
+            pred["chart_numeric_em"] = score
+            chart_numeric_scores.append(score)
 
     return {
         "title_em": (sum(title_scores) / len(title_scores)) if title_scores else 0.0,
@@ -87,4 +92,5 @@ def compute_task_metrics(predictions):
         "quant_token_match": (sum(quant_token_match_scores) / len(quant_token_match_scores)) if quant_token_match_scores else 0.0,
         "quant_token_f1": (sum(quant_token_f1_scores) / len(quant_token_f1_scores)) if quant_token_f1_scores else 0.0,
         "quant_canonical_answer_em": (sum(quant_canonical_em_scores) / len(quant_canonical_em_scores)) if quant_canonical_em_scores else 0.0,
+        "chart_numeric_em": (sum(chart_numeric_scores) / len(chart_numeric_scores)) if chart_numeric_scores else 0.0,
     }

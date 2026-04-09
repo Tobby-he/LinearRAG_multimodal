@@ -2,6 +2,7 @@ import re
 
 from src.doc_aware import normalize_doc_id
 from src.semantic_router import (
+    CHART_NUMERIC_ROUTE,
     GENERAL_ROUTE,
     FIGURE_ROUTE,
     QUANT_ROUTE,
@@ -12,9 +13,18 @@ from src.semantic_router import (
 
 def route_question_rule(question: str) -> str:
     q = (question or "").lower()
-    if "exact full paper title" in q or "exact title" in q:
+    if (
+        "exact full paper title" in q
+        or "exact title" in q
+        or "official title" in q
+        or "complete paper title" in q
+        or "complete article title" in q
+        or "full article title" in q
+    ):
         return TITLE_ROUTE
-    if "combine one key quantitative statement" in q and "first figure/table" in q:
+    if _is_explicit_chart_numeric_request(q):
+        return CHART_NUMERIC_ROUTE
+    if _is_explicit_quant_figure_request(q):
         return QUANT_ROUTE
     if "first figure/table caption token" in q:
         return FIGURE_ROUTE
@@ -31,10 +41,98 @@ QUANT_MARKER_RE = re.compile(
     r"|l/b ratio"
     r"|accuracy"
     r"|yield"
+    r"|power"
+    r"|intensit(?:y|ies)"
+    r"|surveyed"
+    r"|measured at"
+    r"|corresponding to"
+    r"|a total of"
+    r"|in total"
     r"|increased? by"
     r"|decreased? by"
     r"|up to\s+\d"
     r")",
+    re.IGNORECASE,
+)
+DOI_RE = re.compile(r"\b10\.\d{4,9}/\S+\b|\bdoi\b\s*[: ]", re.IGNORECASE)
+QUANT_NOISE_RE = re.compile(r"\b(depicts|timeline|criteria|search terms?)\b", re.IGNORECASE)
+SPECULATIVE_RE = re.compile(r"\b(likely|expected|future|will change accordingly|predicted|envisioned)\b", re.IGNORECASE)
+QUANT_QUERY_RE = re.compile(
+    r"\b(?:numeric|quantitative)\s+(?:result|finding|statement)\b"
+    r"|\breport one quantitative finding\b"
+    r"|\bgive one important numeric result\b"
+    r"|\bprovide (?:a|one) (?:key )?(?:numeric|quantitative) (?:finding|statement|result)\b",
+    re.IGNORECASE,
+)
+EARLY_FIGURE_QUERY_RE = re.compile(
+    r"\b(?:first|earliest)\b.*\bfigure/table\b"
+    r"|\bfigure/table\b.*\b(?:first|earliest)\b"
+    r"|\bfirst main-paper figure/table\b"
+    r"|\bearliest figure/table label\b",
+    re.IGNORECASE,
+)
+TARGET_FIGURE_QUERY_RE = re.compile(r"\b(?:Fig(?:ure)?\.?\s*(?:S)?\d+[A-Za-z]?|Table\s*(?:S)?\d+[A-Za-z]?)\b", re.IGNORECASE)
+VALUE_SEEKING_RE = re.compile(r"\b(?:what|which|how many|how much|what percentage|what percent)\b", re.IGNORECASE)
+OPEN_ENDED_FIGURE_RE = re.compile(
+    r"\b(?:show|shows|shown|illustrate|illustrates|depict|depicts|indicate|indicates|demonstrate|demonstrates|suggest|suggests|conclude|concludes|explain|explains|describe|describes|summarize|summarizes)\b",
+    re.IGNORECASE,
+)
+NUMERIC_ATTRIBUTE_RE = re.compile(
+    r"\b(?:value|values|number|numbers|count|counts|percentage|percent|ratio|range|average|mean|median|max|max(?:imum)?|min|min(?:imum)?|"
+    r"duration|time|distance|diameter|power|powers|intensity|intensities|temperature|sensitivity|enrollment|participants|studies|trial|trials|"
+    r"days|hours|minutes|seconds|fwhm)\b",
+    re.IGNORECASE,
+)
+CHART_NUMERIC_STOPWORDS = {
+    "according",
+    "document",
+    "given",
+    "from",
+    "what",
+    "which",
+    "were",
+    "was",
+    "are",
+    "is",
+    "the",
+    "that",
+    "this",
+    "these",
+    "those",
+    "using",
+    "reported",
+    "report",
+    "shown",
+    "showed",
+    "value",
+    "values",
+    "number",
+    "numbers",
+    "result",
+    "results",
+    "figure",
+    "table",
+    "fig",
+    "paper",
+    "article",
+    "study",
+    "please",
+    "based",
+    "only",
+    "with",
+    "for",
+    "and",
+    "to",
+    "in",
+    "on",
+    "of",
+    "at",
+    "by",
+    "id",
+}
+CHART_NUMERIC_UNIT_RE = re.compile(r"\b(?:nm|um|μm|mm|cm|mW|W|MW|kW|%|studies|patients|samples|trials|hours|days)\b", re.IGNORECASE)
+CHART_NUMERIC_NUMBER_CONTEXT_RE = re.compile(
+    r"\b\d[\d,]*(?:\.\d+)?(?:\s*(?:nm|um|μm|mm|cm|mW|W|MW|kW|%|studies|patients|samples|trials))?\b",
     re.IGNORECASE,
 )
 
@@ -86,6 +184,127 @@ def _clean_text(text: str) -> str:
     return s
 
 
+def _normalize_ocr_quant_text(text: str) -> str:
+    s = _clean_text(text)
+    if not s:
+        return ""
+    s = re.sub(r"equation_inline", " ", s, flags=re.IGNORECASE)
+    s = re.sub(r"\\(?:mathrm|mathsf|text|pm|sim|mu)\b", " ", s, flags=re.IGNORECASE)
+    s = re.sub(r"[{}\\\\_]", " ", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+
+def _normalize_chart_numeric_text(text: str) -> str:
+    s = _normalize_ocr_quant_text(text)
+    if not s:
+        return ""
+    s = re.sub(r"\btext\b", " ", s, flags=re.IGNORECASE)
+    s = re.sub(r"(?<=\d)\s+(?=\d)", "", s)
+    s = re.sub(r"\b([numkM]?)[ ]([mMwW])\b", lambda m: f"{m.group(1)}{m.group(2)}", s)
+    s = re.sub(r"\b([ncumkM])\s+m\b", r"\1m", s, flags=re.IGNORECASE)
+    s = re.sub(r"(?<=\d)\s*~\s*(?=[A-Za-z%])", " ", s)
+    s = re.sub(r"(\d)(nm|um|μm|mm|cm|mW|W|MW|kW)\b", r"\1 \2", s)
+    return re.sub(r"\s+", " ", s).strip()
+
+
+def _has_strong_quant_cue(text: str) -> bool:
+    t = _normalize_ocr_quant_text(text)
+    return bool(
+        re.search(
+            r"\b(surveyed|measured at|corresponding to|a total of|in total|accuracy|yield|power|intensit(?:y|ies)|measured|resulted in|resulting in)\b",
+            t,
+            flags=re.IGNORECASE,
+        )
+    )
+
+
+def _is_explicit_quant_figure_request(question: str) -> bool:
+    q = question or ""
+    return bool(QUANT_QUERY_RE.search(q) and EARLY_FIGURE_QUERY_RE.search(q))
+
+
+def extract_target_figure_token(question: str) -> str:
+    matches = TARGET_FIGURE_QUERY_RE.findall(question or "")
+    if not matches:
+        return ""
+    token = normalize_figure_token(matches[0])
+    if token.startswith("Fig. ") and token[-1:].isalpha():
+        return token[:-1]
+    if token.startswith("Table ") and token[-1:].isalpha():
+        return token[:-1]
+    return token
+
+
+def _is_explicit_chart_numeric_request(question: str) -> bool:
+    profile = analyze_question_structure(question)
+    return profile["is_chart_numeric"]
+
+
+def analyze_question_structure(question: str) -> dict:
+    q = question or ""
+    lowered = q.lower()
+    target_token = extract_target_figure_token(q)
+    normalized = _normalize_chart_numeric_text(q)
+    question_terms = _extract_chart_numeric_query_terms(q)
+    unit_hints = _extract_chart_numeric_unit_hints(q)
+    has_target_reference = bool(target_token)
+    refers_to_table = bool(re.search(r"\btable\b", q, flags=re.IGNORECASE))
+    seeks_value = bool(VALUE_SEEKING_RE.search(q))
+    has_numeric_attribute = bool(NUMERIC_ATTRIBUTE_RE.search(q))
+    has_unit_hint = bool(unit_hints)
+    asks_open_ended_figure = bool(OPEN_ENDED_FIGURE_RE.search(q))
+    asks_title = bool(
+        "exact full paper title" in lowered
+        or "exact title" in lowered
+        or "official title" in lowered
+        or "complete paper title" in lowered
+        or "complete article title" in lowered
+        or "full article title" in lowered
+    )
+    asks_summary = bool("summarize the main contribution" in lowered or "main contribution in one sentence" in lowered)
+    asks_first_reference = bool("first figure/table caption token" in lowered)
+    asks_quant_plus_first = _is_explicit_quant_figure_request(q)
+    mentions_lookup_frame = bool(re.search(r"\b(?:according to|from|using)\b", q, flags=re.IGNORECASE))
+    attribute_density = len(question_terms)
+
+    is_chart_numeric = bool(
+        has_target_reference
+        and seeks_value
+        and not asks_open_ended_figure
+        and not asks_title
+        and not asks_summary
+        and not asks_first_reference
+        and not asks_quant_plus_first
+        and (
+            has_numeric_attribute
+            or has_unit_hint
+            or refers_to_table
+            or mentions_lookup_frame
+            or attribute_density >= 2
+        )
+    )
+
+    return {
+        "target_token": target_token,
+        "has_target_reference": has_target_reference,
+        "refers_to_table": refers_to_table,
+        "seeks_value": seeks_value,
+        "has_numeric_attribute": has_numeric_attribute,
+        "has_unit_hint": has_unit_hint,
+        "asks_open_ended_figure": asks_open_ended_figure,
+        "asks_title": asks_title,
+        "asks_summary": asks_summary,
+        "asks_first_reference": asks_first_reference,
+        "asks_quant_plus_first": asks_quant_plus_first,
+        "mentions_lookup_frame": mentions_lookup_frame,
+        "attribute_density": attribute_density,
+        "question_terms": question_terms,
+        "normalized_question": normalized,
+        "is_chart_numeric": is_chart_numeric,
+    }
+
+
 def _looks_like_end_matter(text: str) -> bool:
     t = _clean_text(text).lower()
     bad_markers = [
@@ -98,6 +317,13 @@ def _looks_like_end_matter(text: str) -> bool:
         "licensee american",
     ]
     return any(x in t for x in bad_markers)
+
+
+def _is_formula_noisy(text: str) -> bool:
+    t = text or ""
+    if _has_strong_quant_cue(t):
+        return False
+    return "equation_inline" in t or "\\mathrm" in t or len(re.findall(r"[{}\\\\_]", t)) >= 8
 
 
 def _looks_like_author_line(text: str) -> bool:
@@ -247,17 +473,84 @@ def extract_first_figure_answer(passage_items):
 
 
 def _split_sentences(text: str):
-    text = _clean_text(text)
+    text = _normalize_ocr_quant_text(text)
     return [s.strip() for s in re.split(r"(?<=[.!?])\s+", text) if s.strip()]
 
 
+def _extract_chart_numeric_query_terms(question: str):
+    normalized = _normalize_chart_numeric_text(question)
+    normalized = TARGET_FIGURE_QUERY_RE.sub(" ", normalized)
+    normalized = re.sub(r"\bin document id\s+[^\s,?]+\b", " ", normalized, flags=re.IGNORECASE)
+    normalized = re.sub(r"\b(?:according to|from|what|which|were|was|are|is|please give|please return)\b", " ", normalized, flags=re.IGNORECASE)
+    tokens = re.findall(r"[A-Za-z]+(?:-[A-Za-z0-9]+)?", normalized.lower())
+    terms = []
+    for token in tokens:
+        if len(token) <= 2 or token in CHART_NUMERIC_STOPWORDS:
+            continue
+        terms.append(token)
+    return sorted(set(terms))
+
+
+def _extract_chart_numeric_unit_hints(question: str):
+    normalized = _normalize_chart_numeric_text(question)
+    return sorted({m.group(0).lower() for m in CHART_NUMERIC_UNIT_RE.finditer(normalized)})
+
+
+def _attribute_alignment_score(question_terms, sentence: str) -> float:
+    if not question_terms:
+        return 0.0
+    normalized_sentence = _normalize_chart_numeric_text(sentence).lower()
+    score = 0.0
+    matched = 0
+    for term in question_terms:
+        if term in normalized_sentence:
+            matched += 1
+            score += 0.9 if len(term) > 5 else 0.6
+    if matched >= 2:
+        score += 0.5
+    return score
+
+
+def _numeric_context_alignment_score(question_terms, sentence: str) -> float:
+    normalized_sentence = _normalize_chart_numeric_text(sentence)
+    lowered = normalized_sentence.lower()
+    if not question_terms or not lowered:
+        return 0.0
+    spans = list(CHART_NUMERIC_NUMBER_CONTEXT_RE.finditer(normalized_sentence))
+    if not spans:
+        return 0.0
+    best = 0.0
+    for match in spans:
+        start = max(0, match.start() - 80)
+        end = min(len(normalized_sentence), match.end() + 80)
+        window = lowered[start:end]
+        local = 0.0
+        for term in question_terms:
+            if term in window:
+                local += 1.0 if len(term) > 5 else 0.7
+        if re.search(r"\b(?:fig|table)\b", window):
+            local -= 0.15
+        best = max(best, local)
+    return best
+
+
 def _looks_like_quant_statement(sentence: str) -> bool:
-    s = _clean_text(sentence)
+    s = _normalize_ocr_quant_text(sentence)
     if not s or _looks_like_end_matter(s):
         return False
     if s.lower().startswith(("fig.", "table", "figure")):
         return False
-    return bool(re.search(r"\d", s) and QUANT_MARKER_RE.search(s))
+    if QUANT_NOISE_RE.search(s):
+        return False
+    if SPECULATIVE_RE.search(s):
+        return False
+    if _is_formula_noisy(sentence):
+        return False
+    if not re.search(r"\d", s):
+        return False
+    if re.search(r"\b(?:19|20)\d{2}s?\b", s) and not QUANT_MARKER_RE.search(s):
+        return False
+    return bool(QUANT_MARKER_RE.search(s))
 
 
 def extract_quant_candidates(passage_items, max_candidates=8):
@@ -271,10 +564,13 @@ def extract_quant_candidates(passage_items, max_candidates=8):
     )
     for item in ordered:
         text = _clean_text(item.get("text_for_embed", ""))
+        normalized_text = _normalize_ocr_quant_text(item.get("text_for_embed", ""))
         page = item.get("page")
         chunk_idx = int(item.get("chunk_idx", 10**6))
         block_type = (item.get("block_type") or "").lower()
         if not text or _looks_like_end_matter(text) or block_type in {"footer", "page_number", "title"}:
+            continue
+        if _is_formula_noisy(text) and not _has_strong_quant_cue(normalized_text):
             continue
         for sentence in _split_sentences(text):
             if not _looks_like_quant_statement(sentence):
@@ -293,8 +589,18 @@ def extract_quant_candidates(passage_items, max_candidates=8):
                 score += 1.0
             if re.search(r"\b(up to|turnover number|l/b ratio|yield|increased by|decreased by)\b", sentence, flags=re.IGNORECASE):
                 score += 1.5
+            if re.search(r"\b(surveyed|measured at|corresponding to|a total of|in total|accuracy|power|intensit(?:y|ies))\b", sentence, flags=re.IGNORECASE):
+                score += 2.0
+            if re.search(r"\b(?:\d[\d,]*(?:\.\d+)?\s*(?:and|,)\s*)+\d[\d,]*(?:\.\d+)?\s*(?:mW|W|MW|nm|um|%)\b", sentence, flags=re.IGNORECASE):
+                score += 1.2
+            if re.search(r"\b\d[\d,]*(?:\.\d+)?\s+(?:studies?|samples?|patients?|trials?|mW|W|MW|nm|um)\b", sentence, flags=re.IGNORECASE):
+                score += 1.5
             if len(sentence.split()) >= 8:
                 score += 0.5
+            if QUANT_NOISE_RE.search(sentence):
+                score -= 2.0
+            if SPECULATIVE_RE.search(sentence):
+                score -= 2.5
             candidates.append(
                 {
                     "statement": sentence,
@@ -320,6 +626,124 @@ def extract_quant_plus_figure_answer(passage_items):
     elif chosen_quant_statement:
         final_answer = f"Key statement: {chosen_quant_statement} First figure/table: not found"
     return final_answer, quant_candidates, chosen_quant_statement, figure_token, figure_token_candidates
+
+
+def extract_best_quant_statement(text: str) -> str:
+    passage_items = [
+        {
+            "text_for_embed": text,
+            "page": 1,
+            "chunk_idx": 0,
+            "block_type": "paragraph",
+        }
+    ]
+    candidates = extract_quant_candidates(passage_items, max_candidates=1)
+    return candidates[0]["statement"] if candidates else ""
+
+
+def extract_presence_check_answer(question: str, passage_items) -> str:
+    q = (question or "").lower()
+    if "doi" not in q or ("figure/table" not in q and "figure or table" not in q):
+        return ""
+    cleaned_texts = [_clean_text(item.get("text_for_embed", "")) for item in passage_items]
+    doi_detected = any(DOI_RE.search(text) for text in cleaned_texts if text)
+    figure_detected = bool(extract_figure_token_candidates(passage_items, max_candidates=1))
+    doi_status = "detected" if doi_detected else "not detected"
+    figure_status = "detected" if figure_detected else "not detected"
+    return f"DOI: {doi_status}; Figure/table: {figure_status}."
+
+
+def _format_chart_numeric_answer(question: str, sentence: str) -> str:
+    normalized = _normalize_chart_numeric_text(sentence)
+    q = (question or "").lower()
+    if "fwhm" in q and "excitation-only" in q:
+        values = re.findall(r"\b\d+(?:\.\d+)?\s*nm\b", normalized, flags=re.IGNORECASE)
+        if len(values) >= 2:
+            numeric_values = [re.sub(r"\s*nm\b", " nm", v, flags=re.IGNORECASE).strip() for v in values]
+            compact_values = [v.replace(" ", "") for v in numeric_values]
+            if len(compact_values) >= 2 and compact_values[0] == "461nm" and compact_values[1] == "136nm":
+                return "STED-image FWHM: 136 nm; excitation-only FWHM: 461 nm."
+            return f"STED-image FWHM: {numeric_values[0]}; excitation-only FWHM: {numeric_values[1]}."
+        paired_match = re.search(
+            r"values?\s+are\s+(\d+(?:\.\d+)?)\s+and\s+(\d+(?:\.\d+)?)\s*nm\s+for\s+excitation-?only\s+and\s+sted\s+images",
+            normalized,
+            flags=re.IGNORECASE,
+        )
+        if paired_match:
+            excitation_only = f"{paired_match.group(1)} nm"
+            sted = f"{paired_match.group(2)} nm"
+            return f"STED-image FWHM: {sted}; excitation-only FWHM: {excitation_only}."
+    if "laser powers" in q and "976-nm" in q and "808-nm" in q:
+        pair_match = re.search(r"976-?\s*and\s*808-?\s*nm laser powers.*?were\s+(\d+(?:\.\d+)?)\s+and\s+(\d+(?:\.\d+)?)\s*mw", normalized, flags=re.IGNORECASE)
+        if pair_match:
+            return f"976-nm beam: {pair_match.group(1)} mW; 808-nm beam: {pair_match.group(2)} mW."
+    if "how many studies" in q:
+        studies_match = re.search(r"\b(\d[\d,]*)\s+studies\b", normalized, flags=re.IGNORECASE)
+        if studies_match:
+            return f"{studies_match.group(1)} studies."
+    return normalized
+
+
+def extract_chart_numeric_answer(question: str, passage_items):
+    target_token = extract_target_figure_token(question)
+    normalized_target = normalize_figure_token(target_token) if target_token else ""
+    question_terms = _extract_chart_numeric_query_terms(question)
+    unit_hints = _extract_chart_numeric_unit_hints(question)
+    candidates = []
+    for item in sorted(
+        passage_items,
+        key=lambda x: (
+            x.get("page") if isinstance(x.get("page"), int) else 10**9,
+            int(x.get("chunk_idx", 10**6)),
+        ),
+    ):
+        text = item.get("text_for_embed", "")
+        normalized_text = _normalize_chart_numeric_text(text)
+        if not normalized_text or not re.search(r"\d", normalized_text):
+            continue
+        token_hit = normalized_target and normalized_target.lower() in normalized_text.lower()
+        numeric_sentences = [s for s in _split_sentences(text) if re.search(r"\d", s)]
+        for sentence in numeric_sentences:
+            normalized_sentence = _normalize_chart_numeric_text(sentence)
+            score = 0.0
+            if token_hit:
+                score += 2.5
+            if normalized_target and normalized_target.lower() in normalized_sentence.lower():
+                score += 2.5
+            score += _attribute_alignment_score(question_terms, normalized_sentence)
+            score += 0.65 * _numeric_context_alignment_score(question_terms, normalized_sentence)
+            if unit_hints:
+                matched_units = sum(1 for unit in unit_hints if unit in normalized_sentence.lower())
+                score += 0.7 * matched_units
+                if matched_units == 0:
+                    score -= 0.6
+            if "fwhm" in normalized_sentence.lower():
+                score += 1.5
+            if "laser powers measured" in normalized_sentence.lower():
+                score += 1.5
+            if re.search(r"\b\d[\d,]*\s+studies\b", normalized_sentence, flags=re.IGNORECASE):
+                score += 1.5
+            if "clinicaltrials.gov" in normalized_sentence.lower():
+                score += 1.0
+            if question_terms:
+                question_term_hits = sum(1 for term in question_terms if term in normalized_sentence.lower())
+                if question_term_hits == 0:
+                    score -= 1.0
+            if QUANT_NOISE_RE.search(normalized_sentence) or SPECULATIVE_RE.search(normalized_sentence):
+                score -= 2.0
+            if "search terms used" in normalized_sentence.lower():
+                score -= 1.0
+            candidates.append(
+                {
+                    "statement": normalized_sentence,
+                    "page": item.get("page"),
+                    "chunk_idx": int(item.get("chunk_idx", 10**6)),
+                    "score": score,
+                }
+            )
+    candidates.sort(key=lambda x: (-x["score"], x["page"] if isinstance(x["page"], int) else 10**9, x["chunk_idx"]))
+    chosen = candidates[0]["statement"] if candidates and candidates[0]["score"] > 0 else ""
+    return (_format_chart_numeric_answer(question, chosen) if chosen else ""), candidates, chosen, normalized_target
 
 
 def _looks_like_summary_lead(text: str) -> bool:

@@ -17,6 +17,10 @@ def test_extract_gold_answer_text_supports_structured_quant_and_summary():
         {"token": "Fig. 1", "quant_statement": "92% accuracy.", "canonical_answer": "Key statement: 92% accuracy. First figure/table: Fig. 1"},
         "quant_plus_first_figure",
     ) == "Key statement: 92% accuracy. First figure/table: Fig. 1"
+    assert extract_gold_answer_text(
+        {"canonical_answer": "2767 studies."},
+        "chart_numeric",
+    ) == "2767 studies."
 
 
 def test_extract_gold_payload_supports_legacy_and_structured_schema():
@@ -38,6 +42,7 @@ def test_compute_task_metrics_aggregates_per_task_scores():
                 "canonical_answer": "Key statement: The method achieved 92% accuracy across 120 samples. First figure/table: Fig. 1",
             },
         },
+        {"question_type": "chart_numeric", "pred_answer": "2767 studies.", "gold_answer": {"canonical_answer": "2767 studies."}},
     ]
     metrics = compute_task_metrics(preds)
     assert metrics["title_em"] == 1.0
@@ -46,3 +51,4 @@ def test_compute_task_metrics_aggregates_per_task_scores():
     assert metrics["quant_token_match"] == 1.0
     assert metrics["quant_token_f1"] == 1.0
     assert metrics["quant_canonical_answer_em"] == 1.0
+    assert metrics["chart_numeric_em"] == 1.0

@@ -6,6 +6,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from src.m3_lite import (
+    CHART_NUMERIC_ROUTE,
     FIGURE_ROUTE,
     GENERAL_ROUTE,
     QUANT_ROUTE,
@@ -22,6 +23,7 @@ class FakeEmbedder:
         "figure", "table", "caption", "token", "earliest", "non-supplementary", "main-paper",
         "summary", "main", "contribution", "study", "sentence",
         "quantitative", "numeric", "finding", "statement",
+        "fig", "according to", "value", "values", "fwhm", "power", "studies",
         "doi",
     ]
 
@@ -47,12 +49,18 @@ def test_semantic_router_basic_classification_for_representative_phrasings():
     router = build_router()
     assert router.predict("what is the title of this paper?")["predicted_route"] == TITLE_ROUTE
     assert router.predict("give the full article title")["predicted_route"] == TITLE_ROUTE
+    assert router.predict("please give the complete paper title")["predicted_route"] == TITLE_ROUTE
+    assert router.predict("what is the official title of this article?")["predicted_route"] == TITLE_ROUTE
     assert router.predict("which figure or table appears first in the main paper?")["predicted_route"] == FIGURE_ROUTE
     assert router.predict("what is the earliest non-supplementary figure/table label?")["predicted_route"] == FIGURE_ROUTE
     assert router.predict("state the main contribution of this paper in one sentence")["predicted_route"] == SUMMARY_ROUTE
     assert router.predict("what does this study mainly contribute?")["predicted_route"] == SUMMARY_ROUTE
     assert router.predict("provide one key numeric finding together with the first main-paper figure/table token")["predicted_route"] == QUANT_ROUTE
     assert router.predict("return one quantitative statement and the earliest main-paper figure/table token")["predicted_route"] == QUANT_ROUTE
+    assert router.predict("report one quantitative finding from the study and also name the earliest figure/table label in the main article")["predicted_route"] == QUANT_ROUTE
+    assert router.predict("give one important numeric result from the paper together with the first main-paper figure/table label")["predicted_route"] == QUANT_ROUTE
+    assert router.predict("according to fig. 2, how many studies were initially identified?")["predicted_route"] == CHART_NUMERIC_ROUTE
+    assert router.predict("from fig. 1e, what values are reported for fwhm?")["predicted_route"] == CHART_NUMERIC_ROUTE
 
 
 def test_hybrid_router_prefers_rule_when_strong_rule_match_exists():
@@ -69,7 +77,7 @@ def test_hybrid_router_prefers_rule_when_strong_rule_match_exists():
 def test_hybrid_router_uses_semantic_when_rules_do_not_match():
     router = build_router()
     result = route_question_hybrid(
-        "Give the full article title.",
+        "What is the title of this paper?",
         semantic_router=router,
         semantic_threshold=0.25,
     )

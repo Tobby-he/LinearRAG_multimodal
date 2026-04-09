@@ -9,12 +9,16 @@ FIGURE_ROUTE = "first_figure_token"
 QUANT_ROUTE = "quant_plus_first_figure"
 SUMMARY_ROUTE = "summary"
 GENERAL_ROUTE = "general"
+CHART_NUMERIC_ROUTE = "chart_numeric"
 
 DEFAULT_ROUTE_PROTOTYPES = {
     TITLE_ROUTE: [
         "What is the exact full paper title?",
         "What is the title of this paper?",
         "Give the full article title.",
+        "Please give the complete paper title.",
+        "What is the official title of this article?",
+        "Return the complete article title.",
     ],
     FIGURE_ROUTE: [
         "What is the first figure/table caption token mentioned?",
@@ -31,6 +35,15 @@ DEFAULT_ROUTE_PROTOTYPES = {
         "Combine one key quantitative statement with the first figure/table caption token.",
         "Provide one key numeric finding together with the first main-paper figure/table token.",
         "Return one quantitative statement and the earliest main-paper figure/table token.",
+        "Report one quantitative finding from the study and also name the earliest figure/table label in the main article.",
+        "Give one important numeric result from the paper together with the first main-paper figure/table label.",
+        "Provide a numeric result and the earliest figure/table label from the main article.",
+    ],
+    CHART_NUMERIC_ROUTE: [
+        "According to Fig. 1, what numeric value is reported?",
+        "According to Fig. 2, how many studies were identified?",
+        "From Fig. 1E, what values are reported for the compared measurements?",
+        "Using the specified figure or table, return only the requested numeric value.",
     ],
     GENERAL_ROUTE: [
         "Does the parsed document explicitly contain a DOI or a figure/table token?",

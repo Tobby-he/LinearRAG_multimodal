@@ -19,8 +19,11 @@ from src.doc_aware import (
     infer_question_type,
     normalize_doc_id,
     parse_doc_id_from_question,
+    resolve_question_type,
     resolve_allowed_doc_hash_ids,
 )
+from src.evidence_candidates import collect_plan_candidates
+from src.evidence_plan import build_evidence_plan
 from src.pdf_structure_graph import (
     build_pdf_structure_state,
     infer_page_from_image_path,
@@ -31,7 +34,10 @@ from src.m3_lite import (
     QUANT_ROUTE,
     SUMMARY_ROUTE,
     TITLE_ROUTE,
+    extract_best_quant_statement,
+    extract_chart_numeric_answer,
     extract_first_figure_answer,
+    extract_presence_check_answer,
     extract_quant_plus_figure_answer,
     extract_summary_answer,
     extract_summary_candidates,
@@ -39,7 +45,8 @@ from src.m3_lite import (
     route_question_hybrid,
     select_doc_passage_items,
 )
-from src.semantic_router import SemanticPrototypeRouter
+from src.semantic_router import CHART_NUMERIC_ROUTE, SemanticPrototypeRouter
+from src.scope_planner import plan_select_evidence
 from src.task_eval import extract_gold_payload
 logger = logging.getLogger(__name__)
 
@@ -70,6 +77,7 @@ class LinearRAG:
         self.image_metadata_by_hash = {}
         self.doc_to_passage_hash_ids = {}
         self.doc_to_image_hash_ids = {}
+        self.image_to_passage_mapping = {}
         self.pdf_structure_state = {}
         self.semantic_router = SemanticPrototypeRouter(
             self.config.embedding_model,
@@ -186,7 +194,7 @@ class LinearRAG:
         for question_info in tqdm(questions, desc="Retrieving"):
             raw_question = question_info["question"]
             target_doc_id, question = parse_doc_id_from_question(raw_question)
-            question_type = infer_question_type(raw_question)
+            question_type = resolve_question_type(question_info, raw_question, logger=logger)
             route_info = route_question_hybrid(
                 question,
                 semantic_router=self.semantic_router,
@@ -197,6 +205,12 @@ class LinearRAG:
             route_confidence = route_info["route_confidence"]
             top_route_scores = route_info["top_route_scores"]
             matched_prototypes = route_info["matched_prototypes"]
+            evidence_plan = build_evidence_plan(
+                question,
+                predicted_route,
+                route_info,
+                target_doc_id=target_doc_id,
+            )
             logger.info(
                 "router_debug question=%s predicted_route=%s route_source=%s route_confidence=%.4f top_route_scores=%s matched_prototypes=%s",
                 raw_question,
@@ -235,119 +249,130 @@ class LinearRAG:
             figure_token_candidates = []
             summary_candidates = []
             quant_candidates = []
+            chart_numeric_candidates = []
             chosen_quant_statement = ""
             chosen_first_figure_token = ""
             direct_answer = None
             image_retrieval_skipped = False
             image_retrieval_skipped_reason = ""
+            scope_retrieved_images = []
+            scope_selected_evidence = []
+            selected_evidence_ids = []
+            selected_slot_assignments = {}
+            scope_score_breakdown = {}
+            structural_feature_hits = {}
+            candidate_reliability = {}
+            slot_reliability = {}
+            plan_reliability = 0.0
+            candidate_count = 0
+            fallback_used = False
+            fallback_reason = ""
 
-            if target_doc_id and predicted_route == TITLE_ROUTE:
-                doc_items = select_doc_passage_items(self.passage_metadata_by_hash, target_doc_id)
-                front_items = [
-                    item for item in sorted(
-                        doc_items,
-                        key=lambda m: (
-                            m.get("page") if isinstance(m.get("page"), int) else 10**9,
-                            int(m.get("chunk_idx", 10**6)),
-                        ),
-                    )
-                    if (not isinstance(item.get("page"), int)) or item.get("page") <= 2
-                ]
-                direct_answer, title_candidates = extract_title_answer(front_items)
-                selected_items = front_items[: self.config.retrieval_top_k]
+            scope_passage_items, scope_image_items, scope_debug = self.run_scope_planner(
+                question,
+                target_doc_id,
+                evidence_plan,
+                question_info,
+            )
+            logger.info(
+                "scope_debug target_doc_id=%s task=%s candidate_count=%d selected_ids=%s fallback_used=%s plan_reliability=%.3f fallback_reason=%s",
+                target_doc_id,
+                evidence_plan.task_type,
+                scope_debug.get("candidate_count", 0),
+                scope_debug.get("selected_evidence_ids", [])[:5],
+                scope_debug.get("fallback_used", False),
+                float(scope_debug.get("plan_reliability", 0.0)),
+                scope_debug.get("fallback_reason", ""),
+            )
+            candidate_count = scope_debug.get("candidate_count", 0)
+            selected_evidence_ids = scope_debug.get("selected_evidence_ids", [])
+            selected_slot_assignments = scope_debug.get("selected_slot_assignments", {})
+            scope_score_breakdown = scope_debug.get("scope_score_breakdown", {})
+            scope_selected_evidence = scope_debug.get("selected_evidence", [])
+            structural_feature_hits = scope_debug.get("structural_feature_hits", {})
+            candidate_reliability = scope_debug.get("candidate_reliability", {})
+            slot_reliability = scope_debug.get("slot_reliability", {})
+            plan_reliability = float(scope_debug.get("plan_reliability", 0.0))
+            fallback_used = scope_debug.get("fallback_used", False)
+            fallback_reason = scope_debug.get("fallback_reason", "")
+
+            if target_doc_id and predicted_route == TITLE_ROUTE and scope_passage_items:
+                direct_answer, title_candidates = extract_title_answer(scope_passage_items)
+                selected_items = scope_passage_items[: self.config.retrieval_top_k]
                 final_passage_hash_ids = [x["hash_id"] for x in selected_items]
-                final_passage_scores = [float(len(selected_items) - i) for i in range(len(selected_items))]
+                final_passage_scores = self.build_scope_scores(selected_items, scope_score_breakdown)
                 evidence_pages = sorted({x.get("page") for x in selected_items if isinstance(x.get("page"), int)})
-                used_route = TITLE_ROUTE
-            elif target_doc_id and predicted_route == FIGURE_ROUTE:
-                doc_items = select_doc_passage_items(self.passage_metadata_by_hash, target_doc_id)
-                direct_answer, figure_token_candidates = extract_first_figure_answer(doc_items)
+                used_route = "scope_title"
+            elif target_doc_id and predicted_route == FIGURE_ROUTE and scope_passage_items:
+                direct_answer, figure_token_candidates = extract_first_figure_answer(scope_passage_items)
                 chosen_first_figure_token = direct_answer
-                selected_items = []
-                seen = set()
-                for cand in figure_token_candidates:
-                    key = (cand.get("page"), cand.get("chunk_idx"))
-                    if key in seen:
-                        continue
-                    seen.add(key)
-                    match = next(
-                        (
-                            item for item in doc_items
-                            if item.get("page") == cand.get("page") and item.get("chunk_idx") == cand.get("chunk_idx")
-                        ),
-                        None,
-                    )
-                    if match is not None:
-                        selected_items.append(match)
-                    if len(selected_items) >= self.config.retrieval_top_k:
-                        break
+                selected_items = scope_passage_items[: self.config.retrieval_top_k]
                 final_passage_hash_ids = [x["hash_id"] for x in selected_items]
-                final_passage_scores = [float(len(selected_items) - i) for i in range(len(selected_items))]
+                final_passage_scores = self.build_scope_scores(selected_items, scope_score_breakdown)
                 evidence_pages = sorted({x.get("page") for x in selected_items if isinstance(x.get("page"), int)})
-                used_route = FIGURE_ROUTE
-            elif target_doc_id and predicted_route == QUANT_ROUTE:
-                doc_items = select_doc_passage_items(self.passage_metadata_by_hash, target_doc_id)
-                direct_answer, quant_candidates, chosen_quant_statement, chosen_first_figure_token, figure_token_candidates = extract_quant_plus_figure_answer(doc_items)
-                selected_items = []
-                seen = set()
-                for cand in figure_token_candidates[:3]:
-                    key = (cand.get("page"), cand.get("chunk_idx"))
-                    if key in seen:
-                        continue
-                    seen.add(key)
-                    match = next(
-                        (
-                            item for item in doc_items
-                            if item.get("page") == cand.get("page") and item.get("chunk_idx") == cand.get("chunk_idx")
-                        ),
-                        None,
-                    )
-                    if match is not None:
-                        selected_items.append(match)
-                for cand in quant_candidates[:3]:
-                    key = (cand.get("page"), cand.get("chunk_idx"))
-                    if key in seen:
-                        continue
-                    seen.add(key)
-                    match = next(
-                        (
-                            item for item in doc_items
-                            if item.get("page") == cand.get("page") and item.get("chunk_idx") == cand.get("chunk_idx")
-                        ),
-                        None,
-                    )
-                    if match is not None:
-                        selected_items.append(match)
-                final_passage_hash_ids = [x["hash_id"] for x in selected_items[: self.config.retrieval_top_k]]
-                final_passage_scores = [float(len(final_passage_hash_ids) - i) for i in range(len(final_passage_hash_ids))]
-                evidence_pages = sorted({x.get("page") for x in selected_items if isinstance(x.get("page"), int)})
-                used_route = QUANT_ROUTE
-            elif target_doc_id and predicted_route == SUMMARY_ROUTE:
-                doc_items = select_doc_passage_items(self.passage_metadata_by_hash, target_doc_id)
-                direct_answer, summary_candidates = extract_summary_answer(doc_items)
-                selected_items = []
-                for cand in summary_candidates[: self.config.retrieval_top_k]:
-                    match = next(
-                        (
-                            item for item in doc_items
-                            if item.get("page") == cand.get("page") and item.get("chunk_idx") == cand.get("chunk_idx")
-                        ),
-                        None,
-                    )
-                    if match is not None:
-                        selected_items.append(match)
+                used_route = "scope_first_figure_token"
+            elif target_doc_id and predicted_route == QUANT_ROUTE and scope_passage_items:
+                direct_answer, quant_candidates, chosen_quant_statement, chosen_first_figure_token, figure_token_candidates = extract_quant_plus_figure_answer(scope_passage_items)
+                candidate_by_id = {item.get("candidate_id"): item for item in scope_selected_evidence}
+                quant_candidate = candidate_by_id.get(selected_slot_assignments.get("QUANT_STATEMENT"))
+                figure_candidate = candidate_by_id.get(selected_slot_assignments.get("FIGURE_TOKEN"))
+                if quant_candidate:
+                    slot_quant_statement = extract_best_quant_statement(quant_candidate.get("text", ""))
+                    if slot_quant_statement:
+                        chosen_quant_statement = slot_quant_statement
+                if figure_candidate and figure_candidate.get("text"):
+                    chosen_first_figure_token = figure_candidate.get("text")
+                if chosen_quant_statement or chosen_first_figure_token:
+                    if chosen_quant_statement and chosen_first_figure_token:
+                        direct_answer = f"Key statement: {chosen_quant_statement} First figure/table: {chosen_first_figure_token}"
+                    elif chosen_first_figure_token:
+                        direct_answer = f"Key statement: not found. First figure/table: {chosen_first_figure_token}"
+                    else:
+                        direct_answer = f"Key statement: {chosen_quant_statement} First figure/table: not found"
+                selected_items = scope_passage_items[: self.config.retrieval_top_k]
                 final_passage_hash_ids = [x["hash_id"] for x in selected_items]
-                final_passage_scores = [float(len(selected_items) - i) for i in range(len(selected_items))]
+                final_passage_scores = self.build_scope_scores(selected_items, scope_score_breakdown)
                 evidence_pages = sorted({x.get("page") for x in selected_items if isinstance(x.get("page"), int)})
-                used_route = SUMMARY_ROUTE
+                used_route = "scope_quant_plus_first_figure"
+            elif target_doc_id and predicted_route == CHART_NUMERIC_ROUTE and scope_passage_items:
+                direct_answer, chart_numeric_candidates, chosen_quant_statement, chosen_first_figure_token = extract_chart_numeric_answer(
+                    question,
+                    scope_passage_items,
+                )
+                candidate_by_id = {item.get("candidate_id"): item for item in scope_selected_evidence}
+                target_figure_candidate = candidate_by_id.get(selected_slot_assignments.get("TARGET_FIGURE_TOKEN"))
+                if target_figure_candidate and target_figure_candidate.get("text"):
+                    chosen_first_figure_token = target_figure_candidate.get("text")
+                selected_items = scope_passage_items[: self.config.retrieval_top_k]
+                final_passage_hash_ids = [x["hash_id"] for x in selected_items]
+                final_passage_scores = self.build_scope_scores(selected_items, scope_score_breakdown)
+                evidence_pages = sorted({x.get("page") for x in selected_items if isinstance(x.get("page"), int)})
+                used_route = "scope_chart_numeric"
+            elif target_doc_id and predicted_route == SUMMARY_ROUTE and scope_passage_items:
+                direct_answer, summary_candidates = extract_summary_answer(scope_passage_items)
+                selected_items = scope_passage_items[: self.config.retrieval_top_k]
+                final_passage_hash_ids = [x["hash_id"] for x in selected_items]
+                final_passage_scores = self.build_scope_scores(selected_items, scope_score_breakdown)
+                evidence_pages = sorted({x.get("page") for x in selected_items if isinstance(x.get("page"), int)})
+                used_route = "scope_summary"
+            elif target_doc_id and predicted_route == GENERAL_ROUTE and scope_passage_items:
+                selected_items = scope_passage_items[: self.config.retrieval_top_k]
+                final_passage_hash_ids = [x["hash_id"] for x in selected_items]
+                final_passage_scores = self.build_scope_scores(selected_items, scope_score_breakdown)
+                evidence_pages = sorted({x.get("page") for x in selected_items if isinstance(x.get("page"), int)})
+                direct_answer = extract_presence_check_answer(question, scope_passage_items) or None
+                used_route = "scope_general"
+                if scope_image_items:
+                    scope_retrieved_images = scope_image_items[: self.config.retrieval_top_k_image]
             elif target_doc_id:
+                fallback_used = True
                 sorted_passage_indices,sorted_passage_scores = self.dense_passage_retrieval(
                     question_embedding, allowed_passage_ids=allowed_passage_ids
                 )
                 if question_type in {"title", "summary"}:
                     page_candidates = self.collect_top_candidate_pages(sorted_passage_indices[: max(self.config.retrieval_top_k * 4, 10)])
                     logger.info("debug_structure title_or_summary target=%s top_page_candidates=%s", target_doc_id, page_candidates[:5])
-                if question_type in {"first_figure_token", "quant_plus_first_figure"}:
+                if question_type in {"first_figure_token", "quant_plus_first_figure", "chart_numeric"}:
                     anchor_pages = self.get_earliest_anchor_pages(target_doc_id)
                     logger.info("debug_structure first_figure target=%s earliest_anchor_pages=%s", target_doc_id, anchor_pages[:5])
                 rerank_pool = max(self.config.retrieval_top_k * 4, self.config.retrieval_top_k)
@@ -361,11 +386,13 @@ class LinearRAG:
                 final_passage_scores = final_passage_scores[:self.config.retrieval_top_k]
                 used_route = "doc_aware_dense"
             elif len(seed_entities) != 0:
+                fallback_used = True
                 sorted_passage_hash_ids,sorted_passage_scores = self.graph_search_with_seed_entities(question_embedding,seed_entity_indices,seed_entities,seed_entity_hash_ids,seed_entity_scores)
                 final_passage_hash_ids = sorted_passage_hash_ids[:self.config.retrieval_top_k]
                 final_passage_scores = sorted_passage_scores[:self.config.retrieval_top_k]
                 used_route = "graph_seed"
             else:
+                fallback_used = True
                 sorted_passage_indices,sorted_passage_scores = self.dense_passage_retrieval(question_embedding)
                 final_passage_indices = sorted_passage_indices[:self.config.retrieval_top_k]
                 final_passage_hash_ids = [self.passage_embedding_store.hash_ids[idx] for idx in final_passage_indices]
@@ -373,9 +400,11 @@ class LinearRAG:
                 used_route = "dense_global"
             final_passages = [self.get_display_passage_text(hid) for hid in final_passage_hash_ids]
 
-            retrieved_images = []
+            retrieved_images = list(scope_retrieved_images)
             if self.config.use_image_retrieval and predicted_route == GENERAL_ROUTE:
-                if target_doc_id and allowed_image_ids == []:
+                if retrieved_images:
+                    pass
+                elif target_doc_id and allowed_image_ids == []:
                     image_retrieval_skipped = True
                     image_retrieval_skipped_reason = "target_doc_has_no_indexed_images"
                     logger.info("image_retrieval skipped target_doc_id=%s reason=%s", target_doc_id, image_retrieval_skipped_reason)
@@ -398,8 +427,13 @@ class LinearRAG:
                         final_passage_hash_ids, final_passages, final_passage_scores, retrieved_images
                     )
 
+            if retrieved_images:
+                retrieved_images = self.enrich_retrieved_images(retrieved_images)
             top_passage_doc_ids = [self.passage_metadata_by_hash.get(hid, {}).get("doc_id", "") for hid in final_passage_hash_ids]
+            top_image_hash_ids = [item.get("hash_id", "") for item in retrieved_images[: self.config.retrieval_top_k_image]]
             top_image_doc_ids = [item.get("doc_id", "") for item in retrieved_images[: self.config.retrieval_top_k_image]]
+            top_image_scores = [float(item.get("score", 0.0)) for item in retrieved_images[: self.config.retrieval_top_k_image]]
+            image_passage_overlap = self.build_image_passage_overlap(retrieved_images, final_passage_hash_ids) if retrieved_images else []
             if target_doc_id and top_passage_doc_ids and any(doc_id != target_doc_id for doc_id in top_passage_doc_ids):
                 logger.warning("doc_hint mismatch passages: target=%s, top_docs=%s", target_doc_id, top_passage_doc_ids)
             if target_doc_id and top_image_doc_ids and any(doc_id != target_doc_id for doc_id in top_image_doc_ids if doc_id):
@@ -418,20 +452,39 @@ class LinearRAG:
                 "route_confidence": route_confidence,
                 "top_route_scores": top_route_scores,
                 "matched_prototypes": matched_prototypes,
+                "evidence_plan": evidence_plan.to_dict(),
+                "plan_slots": list(evidence_plan.evidence_slots),
+                "plan_constraints": list(evidence_plan.structural_constraints),
+                "candidate_count": candidate_count,
+                "selected_evidence_ids": selected_evidence_ids,
+                "selected_evidence_pages": evidence_pages,
+                "selected_slot_assignments": selected_slot_assignments,
+                "scope_score_breakdown": scope_score_breakdown,
+                "structural_feature_hits": structural_feature_hits,
+                "candidate_reliability": candidate_reliability,
+                "slot_reliability": slot_reliability,
+                "plan_reliability": plan_reliability,
+                "fallback_used": fallback_used,
+                "fallback_reason": fallback_reason,
                 "used_route": used_route,
                 "seed_entities": seed_entities,
                 "top_passage_doc_ids": top_passage_doc_ids,
+                "top_image_hash_ids": top_image_hash_ids,
                 "top_image_doc_ids": top_image_doc_ids,
+                "top_image_scores": top_image_scores,
+                "image_passage_overlap": image_passage_overlap,
                 "evidence_pages": evidence_pages,
                 "title_candidates": title_candidates,
                 "figure_token_candidates": figure_token_candidates,
                 "summary_candidates": summary_candidates,
                 "quant_candidates": quant_candidates,
+                "chart_numeric_candidates": chart_numeric_candidates,
                 "chosen_quant_statement": chosen_quant_statement,
                 "chosen_first_figure_token": chosen_first_figure_token,
                 "image_retrieval_skipped": image_retrieval_skipped,
                 "image_retrieval_skipped_reason": image_retrieval_skipped_reason,
                 "parser_coverage_warning": parser_coverage_warning,
+                "scope_selected_evidence": scope_selected_evidence,
                 "direct_answer": direct_answer,
             }
             retrieval_results.append(result)
@@ -439,9 +492,14 @@ class LinearRAG:
 
     def get_display_passage_text(self, passage_hash_id):
         meta = self.passage_metadata_by_hash.get(passage_hash_id, {})
-        if meta and meta.get("display_text"):
-            return meta["display_text"]
-        return self.passage_embedding_store.hash_id_to_text.get(passage_hash_id, "")
+        text = meta.get("display_text") or self.passage_embedding_store.hash_id_to_text.get(passage_hash_id, "")
+        doc_id = meta.get("doc_id")
+        page = meta.get("page")
+        if doc_id and page is not None:
+            return f"[Doc: {doc_id} | Page: {page}] {text}"
+        elif doc_id:
+            return f"[Doc: {doc_id}] {text}"
+        return text
 
     def collect_top_candidate_pages(self, passage_indices):
         page_count = defaultdict(int)
@@ -453,6 +511,80 @@ class LinearRAG:
             if isinstance(page, int):
                 page_count[page] += 1
         return sorted(page_count.items(), key=lambda x: (-x[1], x[0]))
+
+    def build_scope_scores(self, selected_items, scope_score_breakdown):
+        scores = []
+        for item in selected_items:
+            hid = item.get("hash_id")
+            score = 0.0
+            if hid:
+                score = float(scope_score_breakdown.get(f"passage::{hid}", {}).get("final", 0.0))
+            scores.append(score)
+        return scores
+
+    def run_scope_planner(self, question_text, target_doc_id, evidence_plan, question_info):
+        if not target_doc_id:
+            return [], [], {
+                "fallback_used": True,
+                "fallback_reason": "missing_target_doc",
+                "candidate_count": 0,
+                "plan_reliability": 0.0,
+                "slot_reliability": {},
+                "candidate_reliability": {},
+                "structural_feature_hits": {},
+            }
+        candidates, doc_context = collect_plan_candidates(self, target_doc_id, evidence_plan, question_info)
+        plan_result = plan_select_evidence(
+            question_text,
+            evidence_plan,
+            candidates,
+            doc_context,
+            self.config.embedding_model,
+        )
+        selected_evidence = plan_result.get("selected_evidence", [])
+        selected_passage_items = []
+        selected_images = []
+        seen_passages = set()
+        for cand in selected_evidence:
+            if cand["candidate_type"] == "image":
+                image_hash = cand.get("metadata", {}).get("hash_id")
+                if image_hash and image_hash in self.image_metadata_by_hash:
+                    image_meta = dict(self.image_metadata_by_hash[image_hash])
+                    image_meta["hash_id"] = image_hash
+                    image_meta["score"] = float(plan_result.get("score_breakdown", {}).get(cand["candidate_id"], {}).get("final", 0.0))
+                    selected_images.append(image_meta)
+            for node_id in cand.get("source_node_ids", []):
+                if node_id in self.passage_metadata_by_hash and node_id not in seen_passages:
+                    row = dict(self.passage_metadata_by_hash[node_id])
+                    row["hash_id"] = node_id
+                    selected_passage_items.append(row)
+                    seen_passages.add(node_id)
+            for node_id in cand.get("metadata", {}).get("passage_hash_ids", []):
+                if node_id in self.passage_metadata_by_hash and node_id not in seen_passages:
+                    row = dict(self.passage_metadata_by_hash[node_id])
+                    row["hash_id"] = node_id
+                    selected_passage_items.append(row)
+                    seen_passages.add(node_id)
+        selected_passage_items = sorted(
+            selected_passage_items,
+            key=lambda x: (
+                x.get("page") if isinstance(x.get("page"), int) else 10**9,
+                int(x.get("chunk_idx", 10**6)),
+            ),
+        )
+        return selected_passage_items, selected_images, {
+            "candidate_count": len(candidates),
+            "selected_evidence_ids": [x["candidate_id"] for x in selected_evidence],
+            "selected_slot_assignments": plan_result.get("slot_assignments", {}),
+            "scope_score_breakdown": plan_result.get("score_breakdown", {}),
+            "structural_feature_hits": plan_result.get("planner_debug", {}).get("structural_feature_hits", {}),
+            "candidate_reliability": plan_result.get("planner_debug", {}).get("candidate_reliability", {}),
+            "slot_reliability": plan_result.get("planner_debug", {}).get("slot_reliability", {}),
+            "plan_reliability": plan_result.get("planner_debug", {}).get("plan_reliability", 0.0),
+            "fallback_reason": plan_result.get("planner_debug", {}).get("fallback_reason", ""),
+            "selected_evidence": selected_evidence,
+            "fallback_used": plan_result.get("fallback_used", False) or not bool(selected_passage_items or selected_images),
+        }
 
     def get_earliest_anchor_pages(self, doc_id):
         doc_id = normalize_doc_id(doc_id)
@@ -486,7 +618,7 @@ class LinearRAG:
                     score += 0.08
                 elif page <= 4:
                     score += 0.03
-            if question_type in {"first_figure_token", "quant_plus_first_figure"} and anchors:
+            if question_type in {"first_figure_token", "quant_plus_first_figure", "chart_numeric"} and anchors:
                 score += 0.08
             # Preserve local continuity around very top dense passages.
             if hid not in top_anchor and self.is_adjacent_to_any(hid, top_anchor):
@@ -1030,11 +1162,18 @@ class LinearRAG:
             image_metadata_by_hash=self.image_metadata_by_hash,
             infer_page_fn=infer_page_from_image_path,
         )
+        self.image_to_passage_mapping = self.build_image_to_passage_mapping() if self.image_metadata_by_hash else {}
         os.makedirs(os.path.join(self.config.working_dir, self.dataset_name), exist_ok=True)
         with open(os.path.join(self.config.working_dir, self.dataset_name, "passage_metadata.json"), "w", encoding="utf-8") as f:
             json.dump(self.passage_metadata_by_hash, f, ensure_ascii=False, indent=2)
         with open(os.path.join(self.config.working_dir, self.dataset_name, "image_metadata.json"), "w", encoding="utf-8") as f:
             json.dump(self.image_metadata_by_hash, f, ensure_ascii=False, indent=2)
+        with open(os.path.join(self.config.working_dir, self.dataset_name, "doc_to_passage_mapping.json"), "w", encoding="utf-8") as f:
+            json.dump(self.doc_to_passage_hash_ids, f, ensure_ascii=False, indent=2)
+        with open(os.path.join(self.config.working_dir, self.dataset_name, "doc_to_image_mapping.json"), "w", encoding="utf-8") as f:
+            json.dump(self.doc_to_image_hash_ids, f, ensure_ascii=False, indent=2)
+        with open(os.path.join(self.config.working_dir, self.dataset_name, "image_to_passage_mapping.json"), "w", encoding="utf-8") as f:
+            json.dump(self.image_to_passage_mapping, f, ensure_ascii=False, indent=2)
         with open(os.path.join(self.config.working_dir, self.dataset_name, "pdf_structure_state.json"), "w", encoding="utf-8") as f:
             json.dump(self._jsonable_structure_state(), f, ensure_ascii=False, indent=2)
 
@@ -1105,6 +1244,79 @@ class LinearRAG:
                 k: sorted(list(v)) for k, v in out["passage_adjacent_map"].items()
             }
         return out
+
+    def build_image_to_passage_mapping(self):
+        if not self.config.use_image_retrieval:
+            return {}
+        page_nodes = self.pdf_structure_state.get("page_nodes", {})
+        mapping = {}
+        for page_node_id, page_meta in page_nodes.items():
+            doc_id = normalize_doc_id(page_meta.get("doc_id", ""))
+            page = page_meta.get("page")
+            related_passage_ids = sorted(page_meta.get("passage_hash_ids", []))
+            for image_hash_id in page_meta.get("image_hash_ids", []):
+                if image_hash_id in mapping:
+                    raise ValueError(f"Duplicate page mapping detected for image {image_hash_id}: {mapping[image_hash_id]['page_node_id']} and {page_node_id}")
+                image_meta = self.image_metadata_by_hash.get(image_hash_id)
+                if image_meta is None:
+                    raise KeyError(f"Image {image_hash_id} is linked from structure state but missing from image metadata.")
+                image_doc_id = normalize_doc_id(image_meta.get("doc_id", ""))
+                image_page = image_meta.get("page")
+                if image_doc_id != doc_id:
+                    raise ValueError(f"Image {image_hash_id} doc mismatch: metadata={image_doc_id}, structure={doc_id}")
+                if isinstance(image_page, int) and image_page != page:
+                    raise ValueError(f"Image {image_hash_id} page mismatch: metadata={image_page}, structure={page}")
+                mapping[image_hash_id] = {
+                    "image_hash_id": image_hash_id,
+                    "doc_id": doc_id,
+                    "page": page,
+                    "page_node_id": page_node_id,
+                    "related_passage_ids": related_passage_ids,
+                }
+        missing_image_mappings = sorted(set(self.image_metadata_by_hash.keys()) - set(mapping.keys()))
+        if missing_image_mappings:
+            raise KeyError(
+                "Missing page/passage mapping for image hash ids: " + ", ".join(missing_image_mappings[:10])
+            )
+        return mapping
+
+    def require_image_mapping(self, image_hash_id):
+        mapping = self.image_to_passage_mapping.get(image_hash_id)
+        if mapping is None:
+            raise KeyError(f"Missing explicit image-to-passage mapping for image hash id: {image_hash_id}")
+        return mapping
+
+    def enrich_retrieved_images(self, retrieved_images):
+        enriched = []
+        for item in retrieved_images:
+            image_hash_id = item.get("hash_id")
+            if not image_hash_id:
+                raise ValueError(f"Retrieved image item is missing hash_id: {item}")
+            mapping = self.require_image_mapping(image_hash_id)
+            merged = dict(item)
+            merged.setdefault("doc_id", mapping.get("doc_id", ""))
+            merged.setdefault("page", mapping.get("page"))
+            merged["related_passage_ids"] = list(mapping.get("related_passage_ids", []))
+            enriched.append(merged)
+        return enriched
+
+    def build_image_passage_overlap(self, retrieved_images, selected_passage_hash_ids):
+        selected_set = set(selected_passage_hash_ids)
+        overlap_rows = []
+        for item in retrieved_images[: self.config.retrieval_top_k_image]:
+            image_hash_id = item.get("hash_id")
+            mapping = self.require_image_mapping(image_hash_id)
+            related_passage_ids = list(mapping.get("related_passage_ids", []))
+            overlap_ids = [hid for hid in related_passage_ids if hid in selected_set]
+            overlap_rows.append({
+                "image_hash_id": image_hash_id,
+                "doc_id": mapping.get("doc_id", ""),
+                "page": mapping.get("page"),
+                "related_passage_ids": related_passage_ids,
+                "selected_passage_overlap": overlap_ids,
+                "overlap_count": len(overlap_ids),
+            })
+        return overlap_rows
 
     def augment_graph(self):
         self.add_nodes()
